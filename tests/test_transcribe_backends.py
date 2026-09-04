@@ -164,6 +164,121 @@ def test_transcribe_media_raises_on_silent_video(monkeypatch):
         tb.transcribe_media("silent.mp4")
 
 
+# --- groq cloud backend ------------------------------------------------------
+
+def _groq_payload():
+    return {
+        "text": "Hello world. Second part.",
+        "language": "en",
+        "duration": 6.0,
+        "segments": [
+            {"start": 0.0, "end": 3.0, "text": "Hello world."},
+            {"start": 3.0, "end": 6.0, "text": "Second part."},
+        ],
+        "words": [
+            {"word": "Hello", "start": 0.0, "end": 0.5},
+            {"word": "world.", "start": 0.6, "end": 1.0},
+            {"word": "Second", "start": 3.0, "end": 3.4},
+            {"word": "part.", "start": 3.5, "end": 4.0},
+        ],
+    }
+
+
+def test_groq_payload_maps_to_contract():
+    t = tb._groq_payload_to_transcript(_groq_payload())
+
+    assert t["text"] == "Hello world. Second part."
+    assert t["language"] == "en"
+    assert len(t["segments"]) == 2
+    # OpenAI-style complete words get the faster-whisper leading-space
+    # convention, assigned to the segment containing their start.
+    assert [w["word"] for w in t["segments"][0]["words"]] == [" Hello", " world."]
+    assert [w["word"] for w in t["segments"][1]["words"]] == [" Second", " part."]
+    for seg in t["segments"]:
+        for w in seg["words"]:
+            assert type(w["start"]) is float and type(w["end"]) is float
+    # Whole transcript is JSON-serializable (metadata json.dump path).
+    json.dumps(t)
+
+
+def test_groq_offset_shifts_words_and_segments():
+    t = tb._groq_payload_to_transcript(_groq_payload(), offset=120.0)
+    assert t["segments"][1]["start"] == pytest.approx(123.0)
+    assert t["segments"][1]["words"][0]["start"] == pytest.approx(123.0)
+
+
+def test_groq_words_survive_merge_continuation_words():
+    from subtitles import merge_continuation_words
+    t = tb._groq_payload_to_transcript(_groq_payload())
+    for seg in t["segments"]:
+        assert merge_continuation_words(seg["words"]) == seg["words"]
+
+
+def test_groq_without_word_timestamps_synthesizes_them():
+    payload = _groq_payload()
+    payload.pop("words")
+    t = tb._groq_payload_to_transcript(payload)
+    assert len(t["segments"]) == 2
+    for seg in t["segments"]:
+        assert seg["words"]
+        assert seg["words"][0]["word"].startswith(" ")
+
+
+def test_groq_without_segments_synthesizes_one_from_words():
+    payload = _groq_payload()
+    payload.pop("segments")
+    t = tb._groq_payload_to_transcript(payload)
+    assert len(t["segments"]) == 1
+    assert len(t["segments"][0]["words"]) == 4
+    assert t["text"] == "Hello world. Second part."
+
+
+def test_groq_part_plan():
+    # 100 MB of FLAC over an hour, 24 MB cap -> 864 s parts.
+    assert tb._groq_part_plan(100e6, 3600.0, 24e6) == 864
+    assert tb._groq_part_plan(10e6, 600.0, 24e6) is None  # single upload
+    assert tb._groq_part_plan(10e6, 0.0, 24e6) is None  # unknown duration
+
+
+def test_groq_requires_api_key(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="GROQ_API_KEY"):
+        tb._transcribe_with_groq("video.mp4")
+
+
+def test_groq_split_single_part_for_small_audio(tmp_path, monkeypatch):
+    fake_flac = tmp_path / "extracted.flac"
+    fake_flac.write_bytes(b"x" * 1000)
+    monkeypatch.setattr(tb, "_extract_groq_audio",
+                        lambda media, tmpdir: str(fake_flac))
+    parts = tb._split_audio_for_groq("video.mp4", str(tmp_path), 24e6)
+    assert parts == [(str(fake_flac), 0.0)]
+
+
+def test_transcribe_media_falls_back_on_groq_exception(monkeypatch):
+    def boom(path):
+        raise RuntimeError("groq exploded")
+
+    sentinel = {"text": "ok", "language": "en", "segments": []}
+    monkeypatch.setenv("TRANSCRIBE_BACKEND", "groq")
+    monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
+    monkeypatch.setattr(tb, "_transcribe_with_groq", boom)
+    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+    assert tb.transcribe_media("video.mp4") is sentinel
+
+
+def test_transcribe_media_groq_happy_path(monkeypatch):
+    sentinel = {"text": "ok", "language": "en", "segments": []}
+    monkeypatch.setenv("TRANSCRIBE_BACKEND", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
+    monkeypatch.setattr(tb, "_transcribe_with_groq", lambda path: sentinel)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_whisper",
+        lambda path: (_ for _ in ()).throw(AssertionError("should not run")))
+    assert tb.transcribe_media("video.mp4") is sentinel
+
+
 # --- whisper singleton ------------------------------------------------------
 
 @pytest.fixture

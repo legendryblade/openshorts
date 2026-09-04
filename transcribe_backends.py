@@ -1,4 +1,5 @@
-"""Transcription backends: NVIDIA Parakeet (onnx-asr) with faster-whisper fallback.
+"""Transcription backends: Groq cloud ASR, NVIDIA Parakeet (onnx-asr),
+faster-whisper fallback.
 
 Every caller goes through transcribe_media(), which returns the transcript
 contract the whole pipeline depends on:
@@ -18,14 +19,17 @@ Invariants the consumers rely on (clip cutting, karaoke subtitles, Remotion):
   - all numerics are native Python floats (json.dump of the transcript).
   - words sorted by start, segments chronological, absolute file timestamps.
 
-TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet".
+TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet" | "groq".
 The parakeet path falls back to whisper automatically when the model errors,
 produces no usable words, or the detected language is outside its 25
 supported European languages (e.g. Japanese/Chinese/Arabic uploads).
+The groq path (cloud ASR, GROQ_API_KEY required) falls back to local whisper
+on any API error — bad key, upload too large, rate limit, network drop.
 GPU whisper in turn falls back to CPU whisper on CUDA errors (VRAM is shared
 with other models on the host, so loads can OOM under load).
 """
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -330,6 +334,263 @@ def _parakeet_fallback_reason(transcript, duration_hint=None):
     return None
 
 
+# --- groq (cloud ASR) --------------------------------------------------------
+
+def _groq_config():
+    """Groq endpoint config, re-read per call so env changes apply live."""
+    return {
+        "api_key": os.environ.get("GROQ_API_KEY", ""),
+        "base_url": os.environ.get(
+            "GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"),
+        "model": os.environ.get("GROQ_ASR_MODEL", "whisper-large-v3"),
+        "max_upload_mb": float(os.environ.get("GROQ_MAX_UPLOAD_MB", "24")),
+    }
+
+
+def _groq_transcribe_file(path, language=None):
+    """POST one audio file to Groq; returns the verbose_json payload.
+
+    Retries 429/5xx/transport errors with backoff — the free tier throttles
+    aggressively and 503s while models cold-load. Other statuses raise with
+    the response body (bad key, unsupported model) so the caller can fall
+    back instead of retrying forever.
+    """
+    import httpx
+
+    cfg = _groq_config()
+    data = {
+        "model": cfg["model"],
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": ["segment", "word"],
+    }
+    if language:
+        data["language"] = language
+
+    last_err = None
+    for attempt in range(4):
+        if attempt:
+            time.sleep(min(2 ** attempt * 2, 15))
+        try:
+            with open(path, "rb") as f:
+                response = httpx.post(
+                    f"{cfg['base_url']}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                    data=data,
+                    files={"file": (os.path.basename(path), f, "audio/flac")},
+                    timeout=httpx.Timeout(600.0, connect=30.0),
+                )
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 429 or response.status_code >= 500:
+                last_err = RuntimeError(
+                    f"groq HTTP {response.status_code}: {response.text[:200]}")
+                continue
+            raise RuntimeError(
+                f"groq HTTP {response.status_code}: {response.text[:200]}")
+        except (httpx.TransportError, TimeoutError) as e:
+            last_err = e
+    raise last_err
+
+
+def _words_from_segment_text(text, seg_start, seg_end):
+    """Evenly spaced words for payloads without word timestamps.
+
+    whisper-large-v3-turbo on Groq doesn't support word-level granularity;
+    karaoke captions need word entries, so distribute the segment's words
+    evenly across its duration. Leading-space convention matches
+    faster-whisper tokens.
+    """
+    tokens = [t for t in str(text or "").split() if t]
+    if not tokens:
+        return []
+    step = max(seg_end - seg_start, 0.1 * len(tokens)) / len(tokens)
+    return [
+        {"word": " " + tok, "start": float(seg_start + i * step),
+         "end": float(seg_start + (i + 1) * step)}
+        for i, tok in enumerate(tokens)
+    ]
+
+
+def _groq_payload_to_transcript(payload, offset=0.0):
+    """Map a Groq verbose_json payload into the transcribe_media contract.
+
+    Groq reports one top-level `words` list of complete words ("Hello",
+    "world,") while the pipeline expects faster-whisper tokens that carry a
+    LEADING SPACE on word starts. Prepending a space to every word makes
+    merge_continuation_words a no-op (Groq never splits a word) and keeps the
+    karaoke highlight per real word. Each word joins the segment whose
+    [start, end) window contains it.
+    """
+    words = payload.get("words") or []
+    segments = payload.get("segments") or []
+    if segments and not words:
+        print("⚠️ [ASR] groq returned no word timestamps — "
+              f"GROQ_ASR_MODEL={_groq_config()['model']} may not support word "
+              "granularity (whisper-large-v3 does, -turbo does not)")
+
+    out_segments = []
+    text_parts = []
+    wi = 0
+    for seg in segments:
+        seg_start = float(seg["start"]) + offset
+        seg_end = float(seg["end"]) + offset
+        seg_text = str(seg.get("text") or "").strip()
+        seg_words = []
+        while wi < len(words) and float(words[wi]["start"]) + offset < seg_end:
+            w = words[wi]
+            seg_words.append({
+                "word": " " + str(w["word"]),
+                "start": float(w["start"]) + offset,
+                "end": float(w.get("end") if w.get("end") is not None
+                             else w["start"]) + offset,
+            })
+            wi += 1
+        if not seg_words:
+            seg_words = _words_from_segment_text(seg_text, seg_start, seg_end)
+        out_segments.append({
+            "start": seg_start,
+            "end": seg_end,
+            "text": seg_text,
+            "words": merge_continuation_words(seg_words),
+        })
+        text_parts.append(seg_text)
+
+    # Word granularity without segments: synthesize one so the pipeline still
+    # gets a usable transcript.
+    if not out_segments and words:
+        seg_words = [{
+            "word": " " + str(w["word"]),
+            "start": float(w["start"]) + offset,
+            "end": float(w.get("end") if w.get("end") is not None
+                         else w["start"]) + offset,
+        } for w in words]
+        text = " ".join(str(w["word"]).strip() for w in words)
+        out_segments.append({
+            "start": seg_words[0]["start"],
+            "end": seg_words[-1]["end"],
+            "text": text,
+            "words": seg_words,
+        })
+        text_parts = [text]
+
+    return {
+        "text": " ".join(part for part in text_parts if part),
+        "language": str(payload.get("language") or "en"),
+        "segments": out_segments,
+    }
+
+
+def _probe_duration(path):
+    """Media/audio duration in seconds via ffprobe; 0.0 when unreadable."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        return float(out.stdout.strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _groq_part_plan(size_bytes, duration, max_bytes):
+    """Seconds per upload part to stay under the cap, or None for one upload.
+
+    The 300s floor assumes 16kHz mono FLAC speech (~1 MB/min worst case) —
+    a cap that tight would mean the request itself is the problem.
+    """
+    if size_bytes <= max_bytes or duration <= 0:
+        return None
+    part_secs = int(max_bytes / (size_bytes / duration))
+    return max(min(part_secs, 3600), 300)
+
+
+def _extract_groq_audio(media_path, tmpdir):
+    """16kHz mono FLAC extraction — the upload format for every part."""
+    full_path = os.path.join(tmpdir, "audio.flac")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", str(media_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", full_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.PIPE, timeout=1800)
+    return full_path
+
+
+def _split_audio_for_groq(media_path, tmpdir, max_bytes):
+    """Return [(part_path, offset_seconds)] covering the media's audio.
+
+    Offsets come from each part's actual probed duration, so a split landing
+    on a stream discontinuity can't drift the transcript. Parts are named
+    part_%05d.flac by the segment muxer.
+    """
+    full_path = _extract_groq_audio(media_path, tmpdir)
+    part_secs = _groq_part_plan(
+        os.path.getsize(full_path), _probe_duration(full_path), max_bytes)
+    if part_secs is None:
+        return [(full_path, 0.0)]
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", full_path,
+         "-f", "segment", "-segment_time", str(part_secs), "-c:a", "flac",
+         os.path.join(tmpdir, "part_%05d.flac")],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        timeout=1800,
+    )
+    parts = []
+    offset = 0.0
+    for name in sorted(os.listdir(tmpdir)):
+        if name.startswith("part_"):
+            path = os.path.join(tmpdir, name)
+            parts.append((path, offset))
+            offset += _probe_duration(path)
+    return parts or [(full_path, 0.0)]
+
+
+def _transcribe_with_groq(media_path):
+    """Cloud ASR via Groq's OpenAI-compatible Whisper endpoint.
+
+    Turns transcription — the heaviest local CPU stage — into an API call a
+    weak machine can drive; no GPU gate because nothing runs locally. Audio
+    is extracted to 16kHz mono FLAC, split under Groq's upload cap, and each
+    part's timestamps are offset back to absolute file time. Language from
+    the first part is passed as a hint to the rest for consistency. A missing
+    key raises so transcribe_media can fall back to local whisper.
+    """
+    cfg = _groq_config()
+    if not cfg["api_key"]:
+        raise RuntimeError(
+            "GROQ_API_KEY is not set — TRANSCRIBE_BACKEND=groq needs it "
+            "(console.groq.com, free tier works)")
+
+    tmpdir = tempfile.mkdtemp(prefix="groq_asr_")
+    try:
+        parts = _split_audio_for_groq(
+            media_path, tmpdir, cfg["max_upload_mb"] * 1024 * 1024)
+        progress = _TranscribeProgress(
+            sum(_probe_duration(p) for p, _ in parts))
+        segments = []
+        text_parts = []
+        language = None
+        done = 0.0
+        for path, offset in parts:
+            payload = _groq_transcribe_file(path, language=language)
+            language = language or payload.get("language")
+            transcript = _groq_payload_to_transcript(payload, offset=offset)
+            segments.extend(transcript["segments"])
+            text_parts.append(transcript["text"])
+            done += _probe_duration(path)
+            progress.update(done)
+        progress.update(progress.total)
+        return {
+            "text": " ".join(part for part in text_parts if part),
+            "language": str(language or "en"),
+            "segments": segments,
+        }
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # --- public entry point -----------------------------------------------------
 
 class NoAudioError(Exception):
@@ -375,6 +636,16 @@ def transcribe_media(media_path):
                   f"falling back to whisper")
         except Exception as e:
             print(f"⚠️ [ASR] parakeet failed ({type(e).__name__}: {e}) — "
+                  f"falling back to whisper")
+
+    if backend == "groq":
+        try:
+            transcript = _transcribe_with_groq(media_path)
+            print(f"🎙️ [ASR] groq ok: lang={transcript['language']} "
+                  f"segments={len(transcript['segments'])}")
+            return transcript
+        except Exception as e:
+            print(f"⚠️ [ASR] groq failed ({type(e).__name__}: {e}) — "
                   f"falling back to whisper")
 
     return _transcribe_with_whisper(media_path)
