@@ -475,9 +475,24 @@ def _groq_payload_to_transcript(payload, offset=0.0):
 
     return {
         "text": " ".join(part for part in text_parts if part),
-        "language": str(payload.get("language") or "en"),
+        "language": _normalize_language(payload.get("language")),
         "segments": out_segments,
     }
+
+
+def _normalize_language(lang):
+    """Convert Groq's full language names (e.g., "English") to ISO codes ("en")."""
+    if not lang:
+        return "en"
+    lang_lower = str(lang).strip().lower()
+    # Common full names -> ISO 639-1
+    name_to_code = {
+        "english": "en", "spanish": "es", "french": "fr", "german": "de",
+        "italian": "it", "portuguese": "pt", "russian": "ru", "chinese": "zh",
+        "japanese": "ja", "korean": "ko", "arabic": "ar", "hindi": "hi",
+        "dutch": "nl", "polish": "pl", "turkish": "tr", "vietnamese": "vi",
+    }
+    return name_to_code.get(lang_lower, lang_lower[:2] if len(lang_lower) >= 2 else "en")
 
 
 def _probe_duration(path):
