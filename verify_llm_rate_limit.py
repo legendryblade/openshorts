@@ -291,6 +291,38 @@ def verify_stage_integration():
     check("the stage adopts the budget the server advertised",
           main._PACER.limit_tokens == 8000, f"limit={main._PACER.limit_tokens}")
 
+    # A transient answer (a score the schema refuses) must retry AND survive the
+    # settle afterwards: the rewrite's first cut fell through the retry branch
+    # into the success path, where `cost` was still unbound — that killed a real
+    # run on 16-sep-2026 right after a clean 429 recovery proved the other path.
+    queue2 = [
+        httpx.Response(200, headers={"x-ratelimit-limit-tokens": "8000"},
+                       json={"choices": [{"message": {"content":
+                            '{"windows": [{"id": 0, "start": 0, "end": 90, "score": "high"}]}'}}],
+                            "usage": {"prompt_tokens": 700, "completion_tokens": 200}}),
+        httpx.Response(200, headers={"x-ratelimit-limit-tokens": "8000"},
+                       json={"choices": [{"message": {"content": '{"windows": []}'}}],
+                             "usage": {"prompt_tokens": 701, "completion_tokens": 201}}),
+    ]
+    transport2 = httpx.MockTransport(lambda request: queue2.pop(0))
+    llm_backend._client = lambda **kwargs: httpx.Client(transport=transport2, **kwargs)
+    slept2 = []
+    main.time.sleep = lambda seconds: slept2.append(seconds)
+    try:
+        parsed2, cost2 = main._run_gemini_stage(None, "openai/gpt-oss-120b",
+                                                "score these windows",
+                                                gemini_worker.ScoreResponse)
+    finally:
+        main.time.sleep = original_sleep
+        llm_backend._client = original_client
+
+    check("a schema-violating answer is retried as transient",
+          parsed2 == {"windows": []}, f"parsed={parsed2}")
+    check("the transient backoff is the 5s first step", slept2 == [5.0],
+          f"slept={slept2}")
+    check("the retry's bill is settled without touching a bad cost",
+          cost2["input_tokens"] == 701)
+
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)

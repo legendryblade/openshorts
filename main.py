@@ -1577,6 +1577,11 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             who = "LLM server" if use_local else "Gemini"
             print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
             time.sleep(wait)
+            # The continue is load-bearing: falling through runs the settle
+            # below with a `cost` the failed call never produced (16-sep-2026
+            # prod: string score -> validation retry -> UnboundLocalError ->
+            # "Clip detection failed"). The 429 path has always had its own.
+            continue
         # Reached only on success: pay the pacer the real bill and adopt the
         # budget the server advertises, so the next call paces itself.
         _PACER.settle(reserved, _billed_tokens(cost))
