@@ -19,6 +19,13 @@ import sys
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
+# main.py loads YOLO("yolov8n.pt") by a RELATIVE path at import time, and
+# ultralytics downloads missing weights into the CURRENT directory. Run this
+# harness from anywhere else and the download lands there (a 30s-capped shell
+# killed one mid-write on 16-sep-2026, leaving a truncated .pt that broke every
+# later import). Pinning the CWD makes the harness independent of where — and
+# by which shell — it was launched.
+os.chdir(REPO)
 
 FAILURES = []
 

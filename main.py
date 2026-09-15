@@ -1562,6 +1562,10 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                 '500', 'INTERNAL', 'overloaded', 'Deadline',
                 'empty response body', 'did not contain a JSON object',
                 'Failed to parse Gemini JSON response',
+                # The server's JSON validator refusing the model's output: the
+                # same class of flake as Gemini's empty body above, and a retry
+                # (on a looser response_format) recovers it.
+                'json_validate_failed', 'Failed to validate JSON',
                 # OpenAI-compatible servers: model still loading, busy, or a
                 # small model that skipped a required field this time.
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',

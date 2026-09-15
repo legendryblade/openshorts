@@ -71,6 +71,23 @@ def _timeout() -> float:
         return DEFAULT_TIMEOUT
 
 
+def max_completion_tokens() -> int:
+    """Cap for one completion, from ``LLM_MAX_TOKENS``; 0 lets the server decide.
+
+    A reasoning model spends real tokens thinking before it answers — gpt-oss
+    burned 100-200 tokens on trivial replies in testing — and the detail pass
+    then still has to print a whole clip list. Under a low server-side default
+    the thinking can eat the budget and leave an empty generation, which fails
+    the JSON validator with nothing to show for it (15-sep-2026: that is how the
+    clip-selection detail pass died). The cap only costs anything when the
+    tokens are actually generated.
+    """
+    try:
+        return max(0, int(os.environ.get("LLM_MAX_TOKENS", "")))
+    except ValueError:
+        return 0
+
+
 def _headers() -> dict:
     # Ollama ignores the key but the OpenAI client convention (and vLLM with
     # --api-key) wants the header present; "ollama" is the documented placeholder.
@@ -95,6 +112,13 @@ def _is_format_rejection(resp: httpx.Response) -> bool:
     if resp.status_code not in (400, 422):
         return False
     body = resp.text.lower()
+    if "json_validate_failed" in body or "failed to validate json" in body:
+        # The server's OWN validator rejecting the model's output is a format
+        # problem too, and the looser mode is the fix: json_schema is the strict
+        # one, while json_object lets the model through and leaves validation to
+        # pydantic — which is what the caller does anyway. 15-sep-2026: the
+        # detail pass died here with a 400 and an empty failed_generation.
+        return True
     return "response_format" in body or "json_schema" in body or "json_object" in body \
         or "format" in body
 
@@ -174,6 +198,8 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
     with _client() as client:
         for fmt in _response_formats(schema):
             body = {"model": model, "messages": messages, "temperature": 0.2, "stream": False}
+            if max_completion_tokens():
+                body["max_completion_tokens"] = max_completion_tokens()
             if fmt is not None:
                 body["response_format"] = fmt
             resp = client.post(url, json=body, headers=_headers())
