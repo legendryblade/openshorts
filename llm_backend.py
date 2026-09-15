@@ -99,6 +99,60 @@ def _is_format_rejection(resp: httpx.Response) -> bool:
         or "format" in body
 
 
+class RateLimitError(RuntimeError):
+    """A 429 from the server, carrying the wait the server asked for.
+
+    The retry policy lives in the caller (``main._run_gemini_stage``), so the
+    wait has to travel with the error: Groq answers a TPM breach with
+    ``retry-after`` / ``x-ratelimit-reset-tokens`` against a 60-second window,
+    and a blind 5s + 10s backoff can never outlast that. Subclasses
+    RuntimeError, and the message still contains "429", so callers that only
+    classify by text keep working.
+    """
+
+    def __init__(self, message, status_code=429, retry_after=None, rate_limit=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.rate_limit = rate_limit or {}
+
+
+def parse_rate_limit_headers(headers) -> dict:
+    """The rate-limit numbers a response advertises, as plain values.
+
+    Groq sends them on every completion (measured 15-sep-2026, free tier:
+    ``x-ratelimit-limit-tokens: 8000``, ``x-ratelimit-remaining-tokens: 5019``,
+    ``x-ratelimit-reset-tokens: 22.357s``), so the pacer learns the real budget
+    off the wire instead of trusting a hardcoded constant.
+    """
+    import clip_selection
+
+    def _int(name):
+        raw = headers.get(name)
+        try:
+            return int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+
+    info = {}
+    for key, header in (
+        ("limit_tokens", "x-ratelimit-limit-tokens"),
+        ("remaining_tokens", "x-ratelimit-remaining-tokens"),
+        ("limit_requests", "x-ratelimit-limit-requests"),
+        ("remaining_requests", "x-ratelimit-remaining-requests"),
+    ):
+        value = _int(header)
+        if value is not None:
+            info[key] = value
+    reset_tokens = clip_selection.parse_go_duration(headers.get("x-ratelimit-reset-tokens"))
+    if reset_tokens is not None:
+        info["reset_tokens_seconds"] = reset_tokens
+    retry_after = clip_selection.parse_retry_after(headers.get("retry-after"))
+    if retry_after is not None:
+        info["retry_after"] = retry_after
+    return info
+
+
 def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = None,
                   ) -> Tuple[dict, Optional[dict]]:
     """One chat completion that must come back as JSON matching ``schema``.
@@ -129,8 +183,14 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
                 last_rejection = resp.text[:200]
                 continue
             if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"LLM server {resp.status_code} from {url}: {resp.text[:300]}")
+                rate_limit = parse_rate_limit_headers(resp.headers)
+                message = f"LLM server {resp.status_code} from {url}: {resp.text[:300]}"
+                if resp.status_code == 429:
+                    raise RateLimitError(
+                        message, rate_limit=rate_limit,
+                        retry_after=rate_limit.get("retry_after")
+                        or rate_limit.get("reset_tokens_seconds"))
+                raise RuntimeError(message)
             data = resp.json()
             break
         else:
@@ -161,5 +221,9 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
         "model": model,
         "price_estimated": False,
         "local": True,
+        # The server's own rate-limit numbers, learned on every call: the pacer
+        # in main.py adopts x-ratelimit-limit-tokens from here instead of
+        # hardcoding a provider's budget.
+        "rate_limit": parse_rate_limit_headers(resp.headers),
     }
     return validated, cost

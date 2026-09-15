@@ -26,8 +26,9 @@ import hook_grounding
 import layout_picker
 import llm_backend
 from clip_selection import (build_transcript_windows, clip_count_targets,
-                            clip_duration_bounds, snap_clip_to_words,
-                            trim_to_best)
+                            clip_duration_bounds, estimate_prompt_tokens,
+                            is_daily_quota_error, snap_clip_to_words,
+                            TokenPacer, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
 from dotenv import load_dotenv
@@ -1482,39 +1483,82 @@ def _run_gemini_stage(client, model_name, prompt, schema):
     the call goes there instead of Gemini and ``client`` is unused; the
     retry policy is shared because a local server has the same failure
     shapes (connection refused while the model loads, a truncated body,
-    a 5xx from a busy vLLM)."""
+    a 5xx from a busy vLLM).
+
+    Rate limits get their own policy, because the generic one could never clear
+    one: the free tiers answer 429 against a 60-SECOND token window (Groq:
+    8,000 TPM), so a 5s + 10s backoff fails while still inside the window. Here
+    the server's own ``Retry-After`` wins when it sends one, the wait starts at
+    a full window when it does not, and a DAY quota — Gemini's 20 free requests
+    — fails immediately with an explanation, since no amount of waiting clears
+    it. Calls are paced against the token budget before they are sent, so the
+    limit is normally never hit at all.
+    """
     use_local = llm_backend.active()
     config = None if use_local else genai_types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
     )
+    budget = llm_tpm_limit()
+    if budget:
+        _PACER.set_limit(budget)
+    # Reserve the worst case BEFORE the call and refund the difference after, so
+    # several scoring workers cannot spend the same tokens twice.
+    reserved = estimate_prompt_tokens(prompt) + _EXPECTED_OUTPUT_TOKENS
     max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
+    rate_limit_attempts = _env_count("LLM_RATE_LIMIT_ATTEMPTS", 4, minimum=1)
+    attempt = 0
+    rate_attempt = 0
+    while True:
+        paced = _PACER.reserve(reserved)
+        if paced >= 1:
+            print(f" Pacing to stay inside the {_PACER.limit_tokens} token/min "
+                  f"budget (waited {paced:.0f}s)...")
         try:
             if use_local:
-                return llm_backend.generate_json(prompt, schema, model=model_name)
-            response = client.models.generate_content(model=model_name, contents=prompt, config=config)
-            # Policy blocks are deterministic — retrying only burns quota and
-            # time, and the user deserves the real reason instead of a generic
-            # "empty response" (prod 23-jul: PROHIBITED_CONTENT on every try).
-            gemini_worker.raise_if_blocked(response)
-            # Parsing lives inside the retry loop on purpose: Gemini sometimes
-            # returns 200 with an empty body, which raises here rather than at
-            # the call. Retrying that recovered every occurrence seen in prod
-            # (22-jul-2026) — the same payload succeeds on the next attempt.
-            parsed_obj = getattr(response, "parsed", None)
-            if parsed_obj is not None:
-                parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
+                parsed, cost = llm_backend.generate_json(prompt, schema, model=model_name)
             else:
-                parsed = gemini_worker._parse_json_response_text(
-                    gemini_worker._get_response_text(response))
-            return parsed, gemini_worker._calculate_cost_analysis(response, model_name)
+                response = client.models.generate_content(model=model_name, contents=prompt, config=config)
+                # Policy blocks are deterministic — retrying only burns quota and
+                # time, and the user deserves the real reason instead of a generic
+                # "empty response" (prod 23-jul: PROHIBITED_CONTENT on every try).
+                gemini_worker.raise_if_blocked(response)
+                # Parsing lives inside the retry loop on purpose: Gemini sometimes
+                # returns 200 with an empty body, which raises here rather than at
+                # the call. Retrying that recovered every occurrence seen in prod
+                # (22-jul-2026) — the same payload succeeds on the next attempt.
+                parsed_obj = getattr(response, "parsed", None)
+                if parsed_obj is not None:
+                    parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
+                else:
+                    parsed = gemini_worker._parse_json_response_text(
+                        gemini_worker._get_response_text(response))
+                cost = gemini_worker._calculate_cost_analysis(response, model_name)
         except gemini_worker.GeminiBlockedError:
+            _PACER.settle(reserved, 0)
             raise  # deterministic policy block — never retry
         except Exception as e:
+            _PACER.settle(reserved, 0)  # a rejected call billed nothing
             msg = str(e)
+            if is_daily_quota_error(msg):
+                raise RuntimeError(
+                    f"{msg[:200]} — that is a DAILY quota, so retrying cannot "
+                    "clear it: wait for the reset, use another key, or point "
+                    "LLM_BASE_URL at another provider. (The per-minute case is "
+                    "paced automatically; LLM_TPM_LIMIT tunes the budget.)")
+            if _is_rate_limit_error(e, msg):
+                rate_attempt += 1
+                if rate_attempt >= rate_limit_attempts:
+                    raise
+                wait = _rate_limit_wait(e, rate_attempt)
+                who = "LLM server" if use_local else "Gemini"
+                print(f"⚠️ {who} rate limited (attempt {rate_attempt}/"
+                      f"{rate_limit_attempts}); waiting {wait:.0f}s for the token "
+                      f"window to refill: {msg[:120]}")
+                time.sleep(wait)
+                continue
             transient = any(tok in msg for tok in (
-                '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
+                '503', 'UNAVAILABLE',
                 '500', 'INTERNAL', 'overloaded', 'Deadline',
                 'empty response body', 'did not contain a JSON object',
                 'Failed to parse Gemini JSON response',
@@ -1522,12 +1566,20 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                 # small model that skipped a required field this time.
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
                 'validation error'))
-            if attempt == max_attempts or not transient:
+            attempt += 1
+            if attempt >= max_attempts or not transient:
                 raise
             wait = 5 * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
             print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
             time.sleep(wait)
+        # Reached only on success: pay the pacer the real bill and adopt the
+        # budget the server advertises, so the next call paces itself.
+        _PACER.settle(reserved, _billed_tokens(cost))
+        advertised = (cost or {}).get("rate_limit") or {}
+        if advertised.get("limit_tokens"):
+            _PACER.set_limit(advertised["limit_tokens"])
+        return parsed, cost
 
 
 def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs, label):
@@ -1568,6 +1620,80 @@ def score_batch_size():
         except ValueError:
             pass
     return 3 if llm_backend.active() else 8
+
+
+# --- LLM rate-limit pacing (TPM) ---------------------------------------------
+# Groq's free tier allows 8,000 tokens/minute on gpt-oss-120b while one scoring
+# batch costs ~900, and Pass 1 fires its batches back to back: a 39-minute
+# video's ~34 windows all land inside a SINGLE 60-second window, so every call
+# past the budget comes back 429. That is what killed clip selection (15-sep-
+# 2026) — see clip_selection.TokenPacer. One pacer serves every scoring worker,
+# and its budget is adopted from the server's own x-ratelimit-limit-tokens
+# header, so the common case needs no configuration at all; LLM_TPM_LIMIT
+# overrides it for a provider that advertises nothing.
+_PACER = TokenPacer()
+_EXPECTED_OUTPUT_TOKENS = 400  # gpt-oss spends real tokens on reasoning
+
+
+def _env_count(name, default, minimum=0):
+    """Integer from the environment, clamped to ``minimum``, else ``default``."""
+    try:
+        return max(minimum, int(os.environ.get(name, "")))
+    except ValueError:
+        return default
+
+
+def _billed_tokens(cost):
+    """Tokens a call billed, as the pacer counts them (input + output)."""
+    if not isinstance(cost, dict):
+        return 0
+    return int(cost.get("input_tokens") or 0) + int(cost.get("output_tokens") or 0)
+
+
+def llm_tpm_limit():
+    """Tokens/minute to pace against; 0 means learn it from response headers."""
+    return _env_count("LLM_TPM_LIMIT", 0, minimum=0)
+
+
+def _is_rate_limit_error(error, message):
+    """True for a 429 / RESOURCE_EXHAUSTED, however the provider spells it.
+
+    ``RateLimitError`` carries the status; Gemini's SDK raises a ClientError
+    whose only tell is the text, so the message is checked too.
+    """
+    if getattr(error, "status_code", None) == 429:
+        return True
+    text = str(message or "").lower()
+    return "429" in text or "resource_exhausted" in text or "rate limit" in text
+
+
+def _rate_limit_wait(error, rate_attempt):
+    """Seconds to wait before retrying a rate-limited call.
+
+    The server's own answer wins when it gives one — Groq sends ``Retry-After``
+    and ``x-ratelimit-reset-tokens``, and it knows when its window refills.
+    Otherwise wait out a whole 60-second window: a per-minute budget cannot
+    refill any sooner, so the old 5s + 10s backoff guaranteed failure.
+    """
+    retry_after = getattr(error, "retry_after", None)
+    try:
+        if retry_after:
+            return min(max(float(retry_after), 1.0), 120.0)
+    except (TypeError, ValueError):
+        pass
+    return min(60.0 * max(1, int(rate_attempt or 1)), 120.0)
+
+
+def score_concurrency():
+    """Scoring calls allowed in flight at once (``--max-concurrent``).
+
+    Default 1. The pacer alone keeps a single worker inside the token budget,
+    and on the free tiers 34 windows still score in a couple of minutes; the
+    knob only pays off when the budget is generous or the endpoint is local and
+    the limit is round trips, not tokens. Sharing the pacer is what makes a
+    raised value safe, since tokens are reserved before a request can be sent.
+    """
+    return _env_count("CLIP_SCORE_CONCURRENCY", 1, minimum=1)
 
 
 def get_viral_clips(transcript_result, video_duration):
@@ -1627,10 +1753,26 @@ def get_viral_clips(transcript_result, video_duration):
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
-        for b in range(0, len(windows), SCORE_BATCH):
-            scored.extend(_run_stage_split(
-                client, model_name, windows[b:b + SCORE_BATCH], _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
+        batches = [windows[b:b + SCORE_BATCH]
+                   for b in range(0, len(windows), SCORE_BATCH)]
+        # Parallel only when asked for. The pacer keeps the COMBINED rate inside
+        # the token budget, so a raised count is safe — it buys latency, and on
+        # a free tier the extra workers mostly wait their turn.
+        workers = max(1, min(score_concurrency(), len(batches)))
+        if workers == 1:
+            for batch in batches:
+                scored.extend(_run_stage_split(
+                    client, model_name, batch, _score_prompt,
+                    gemini_worker.ScoreResponse, "windows", costs, "score"))
+        else:
+            print(f"   Scoring {len(batches)} batch(es) with {workers} worker(s).")
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(
+                    _run_stage_split, client, model_name, batch, _score_prompt,
+                    gemini_worker.ScoreResponse, "windows", costs, "score")
+                    for batch in batches]
+                for future in as_completed(futures):
+                    scored.extend(future.result())
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
@@ -1821,8 +1963,15 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--max-concurrent', type=int, default=None, metavar='N',
+                        help="Clip-picking calls to run at once (default 1). Token "
+                             "pacing applies either way, so this is a latency knob.")
 
     args = parser.parse_args()
+    if args.max_concurrent is not None:
+        # Same knob the scoring stage reads, so the CLI and the API configure it
+        # one way and a job override stays local to this process.
+        os.environ["CLIP_SCORE_CONCURRENCY"] = str(max(1, args.max_concurrent))
     output_format = args.format
 
     script_start_time = time.time()

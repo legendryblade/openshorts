@@ -9,6 +9,7 @@
 
 # Python virtual environment
 .venv/
+.venv311/
 __pycache__/
 *.pyc
 
