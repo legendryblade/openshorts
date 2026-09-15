@@ -518,8 +518,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                   f"{facecam_rect['w']:.2f}x{facecam_rect['h']:.2f}, "
                   f"conf {facecam_rect['confidence']:.2f})")
         else:
-            print("   ⚠️ No usable facecam window — falling back to SCREENCAST")
-            strategies = ['SCREENCAST' if s == 'GAMING_SPLIT' else s for s in strategies]
+            print("   ⚠️ No usable facecam window — falling back to full-width layout")
+            strategies = ['WIDE' if s == 'GAMING_SPLIT' else s for s in strategies]
 
     xs = _analyze_trajectory(input_video, scene_boundaries, strategies, fps,
                              orig_w, orig_h, cameraman, tracker)

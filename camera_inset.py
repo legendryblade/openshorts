@@ -305,7 +305,9 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect, facecam
     Args:
         orig_w, orig_h: source dimensions
         out_w, out_h: output dimensions (e.g., 1080x1920)
-        facecam_rect: (x, y, w, h) tuple OR {x, y, w, h} dict in SOURCE pixels - the facecam window
+        facecam_rect: the facecam window as a dict with NORMALIZED coords
+            (0-1 fractions of the frame, the shape facecam_extractor returns)
+            or a plain (x, y, w, h) tuple in SOURCE pixels
         facecam_dest: "top" or "bottom" - where to place facecam PiP panel
         gameplay_crop: "horizontal", "vertical", or "auto"
     
@@ -319,6 +321,14 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect, facecam
         fx, fy, fw, fh = facecam_rect['x'], facecam_rect['y'], facecam_rect['w'], facecam_rect['h']
     else:
         fx, fy, fw, fh = facecam_rect
+    # Normalized input (detector output) is scaled to source pixels; a rect in
+    # source pixels passes through. Above 1.0 can only be pixels, since a
+    # fraction of a frame never exceeds 1. Feeding the detector's 0.23 straight
+    # to int() made crop=w=0:h=0, and ffmpeg died with STATUS_INVALID_USER_STACK
+    # on every clip of the GTA run — silently, each one then falling back to the
+    # v1 frame loop (16-sep-2026).
+    if fw <= 1.0:
+        fx, fy, fw, fh = fx * orig_w, fy * orig_h, fw * orig_w, fh * orig_h
     x, y, w, h = int(fx), int(fy), int(fw), int(fh)
     
     # Facecam destination panel - 25% of output height
