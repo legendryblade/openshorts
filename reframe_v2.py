@@ -23,6 +23,8 @@ import tempfile
 
 import active_speaker
 import camera_inset
+import facecam_extractor
+import layout_picker
 import punch_in
 import screencast_layout
 import layout_ranges
@@ -291,11 +293,11 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
             strategy = (scene_strategies[current_scene_index]
                         if current_scene_index < len(scene_strategies) else 'TRACK')
 
-            # SPLIT, SCREENCAST and WIDE crops are static (fixed boxes for the
-            # whole scene), so like GENERAL they need no camera trajectory.
-            # ALTERNATE gets one written in after this pass.
+            # SPLIT, SCREENCAST, WIDE and GAMING_SPLIT crops are static (fixed
+            # boxes for the whole scene), so like GENERAL they need no camera
+            # trajectory. ALTERNATE gets one written in after this pass.
             if strategy in ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE',
-                            'INSET', 'ALTERNATE'):
+                            'INSET', 'ALTERNATE', 'GAMING_SPLIT'):
                 cameraman.current_center_x = orig_w / 2
                 cameraman.target_center_x = orig_w / 2
                 xs.append(None)
@@ -396,20 +398,32 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     else:
         strategies = m.analyze_scenes_strategy(input_video, scenes)
 
+    # GAMING_SPLIT is a whole-video layout chosen by the layout picker: gaming
+    # footage with a persistent corner facecam. It beats every per-scene
+    # upgrade (SPLIT/INSET/SCREENCAST) because the facecam window is the
+    # streamer's webcam feed — cropping around heads inside gameplay footage
+    # is exactly the failure mode this layout exists to replace. Decided here,
+    # applied after the per-scene strategies run below (their dicts must exist).
+    gaming_layout = (not passthrough and not force_strategy
+                     and getattr(layout_picker, "DECISION", "none") == "gaming_split"
+                     and facecam_extractor.ENABLED)
+
     # SPLIT is an upgrade applied on top of the TRACK/GENERAL verdict, keyed by
     # the scene's START FRAME rather than its index: scene_frame_ranges() drops
     # empty ranges, so indices there don't line up with `scenes`. A surviving
     # range always keeps its original start_f (the clamp only bites on scenes
     # that begin past the last decoded frame, and those get dropped).
+    # Skipped entirely under GAMING_SPLIT — that layout owns the whole video.
     splits = {}
     split_scene_of = {}
-    detected_splits = {} if passthrough else split_layout.detect_split_scenes(
-        input_video, scenes, strategies)
-    for scene_idx, centres in detected_splits.items():
-        strategies[scene_idx] = 'SPLIT'
-        start_f = scene_boundaries[scene_idx][0]
-        splits[start_f] = centres
-        split_scene_of[start_f] = scene_idx
+    if not gaming_layout:
+        detected_splits = {} if passthrough else split_layout.detect_split_scenes(
+            input_video, scenes, strategies)
+        for scene_idx, centres in detected_splits.items():
+            strategies[scene_idx] = 'SPLIT'
+            start_f = scene_boundaries[scene_idx][0]
+            splits[start_f] = centres
+            split_scene_of[start_f] = scene_idx
 
     # Geometry alone will stack a scene where one person never speaks. Ask who
     # is actually talking before spending half the frame on the other one.
@@ -444,7 +458,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # five clips that had one, while camera_inset.detect finds all five with no
     # false positives. The box is fixed for the whole video, so it is found once.
     inset = None
-    if content_ranges and screencast_layout.ENABLED:
+    if not gaming_layout and content_ranges and screencast_layout.ENABLED:
         try:
             inset = camera_inset.detect(input_video)
         except Exception as e:
@@ -455,7 +469,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     screencasts = {}
     wide_count = 0
     inset_count = 0
-    if content_ranges:
+    if not gaming_layout and content_ranges:
         for scene_idx, (plan, centre) in screencast_layout.detect_screencast_scenes(
                 input_video, scenes, strategies, content_ranges).items():
             # An inset beats both screen plans: it is the only one that can show
@@ -484,6 +498,28 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # delivery size doesn't move the camera; only the final scale= uses it.
     cameraman = m.SmoothedCameraman(out_w, out_h, orig_w, orig_h, aspect_ratio=aspect_ratio)
     tracker = m.SpeakerTracker(cooldown_frames=30)
+
+    # Gaming split: detect the facecam window once for the whole video. The
+    # result is normalized (0-1) coords plus corner/stability; the render
+    # converts to source pixels inside the filtergraph builder.
+    facecam_rect = None
+    if gaming_layout:
+        strategies = ['GAMING_SPLIT'] * len(strategies)
+        content_ranges = []
+        splits.clear()
+        print("   🎮 Gaming split layout: whole video (facecam + gameplay)")
+        try:
+            facecam_rect = facecam_extractor.detect_facecam_window(input_video)
+        except Exception as e:
+            print(f"   ⚠️ Facecam detection failed ({e})")
+        if facecam_rect:
+            print(f"   📹 Facecam window: {facecam_rect['corner']} "
+                  f"({facecam_rect['x']:.2f},{facecam_rect['y']:.2f} "
+                  f"{facecam_rect['w']:.2f}x{facecam_rect['h']:.2f}, "
+                  f"conf {facecam_rect['confidence']:.2f})")
+        else:
+            print("   ⚠️ No usable facecam window — falling back to SCREENCAST")
+            strategies = ['SCREENCAST' if s == 'GAMING_SPLIT' else s for s in strategies]
 
     xs = _analyze_trajectory(input_video, scene_boundaries, strategies, fps,
                              orig_w, orig_h, cameraman, tracker)
@@ -547,6 +583,9 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
             elif strategy == 'GENERAL':
                 graph = general_filtergraph(out_w, out_h,
                                             orig_w=orig_w, orig_h=orig_h)
+            elif strategy == 'GAMING_SPLIT':
+                graph = camera_inset.gaming_split_filtergraph(
+                    orig_w, orig_h, out_w, out_h, facecam_rect)
             else:
                 seg_xs = [x if x is not None else 0 for x in xs[start_f:end_f]]
                 cmd_path = os.path.join(workdir, f"cmd_{idx:03d}.txt")

@@ -123,10 +123,19 @@ Return only:
 """
 
 
+class FacecamRectModel(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+
+
 class LayoutChoice(BaseModel):
     layout: str
     confidence: float
     why: str
+    facecam_rect: str = ""
+    gameplay_crop: str = ""
 
 
 # Scored 94/92/96% over the 48-clip corpus against hand-checked labels, with
@@ -158,11 +167,26 @@ Pick ONE layout:
 - "split": stack two people. ONLY when two people are visible IN THE SAME SHOT
   at the same time in most frames, talking to each other. Frames that alternate
   between one-person close-ups are NOT this, however many people appear.
+- "gaming_split": gaming video with a persistent facecam window in a corner.
+  The video shows gameplay with a small camera feed (facecam) composited into
+  one corner. The facecam includes the person AND their background (chair, wall,
+  mic, etc.) — NOT just a face crop. We will extract the ENTIRE facecam window
+  as a separate layer and place it as a picture-in-picture. The gameplay will
+  be cropped to exclude the original facecam area. Use this when:
+  - There is a persistent facecam in a corner (top-left, top-right, bottom-left,
+    bottom-right) that stays in the same position
+  - The facecam shows a person with upper body/background, not just a face
+  - The main content is gameplay or screen recording
+  Do NOT use this for: talking heads without gameplay, picture-in-picture that
+  moves around, or when the facecam is the main content.
 
 "none" is by far the most common correct answer. Choose anything else only if
 you would defend it to an editor. If you are unsure, answer "none".
 
 confidence is 0..1. why is at most 12 words.
+If layout is "gaming_split", also return:
+- facecam_rect: {x, y, w, h} as fractions of frame width/height (0-1)
+- gameplay_crop: "horizontal" (remove top/bottom strip) or "vertical" (remove left/right strip)
 """
 
 
@@ -175,6 +199,24 @@ class WideContentRangeModel(BaseModel):
 
 class WideContentResponse(BaseModel):
     ranges: List[WideContentRangeModel]
+
+
+class FacecamRectModel(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+class FacecamDetectionResponse(BaseModel):
+    """Detected facecam window in normalized coordinates (0-1)."""
+    x: float
+    y: float
+    w: float
+    h: float
+    confidence: float
+    corner: str
+    is_stable: bool
 
 
 WIDE_CONTENT_PROMPT_TEMPLATE = """
@@ -217,6 +259,40 @@ TIME CONTRACT — STRICT:
 
 For "what", name the content in three words or fewer (e.g. "stock chart",
 "spreadsheet", "corner ticker").
+"""
+
+
+# Facecam window detection prompt - separate call for precise rectangle detection
+FACECAM_DETECTION_PROMPT = """
+These frames are sampled from a gaming/video recording that has a persistent
+facecam window composited into one corner. Your task is to detect the EXACT
+rectangle of that facecam window.
+
+The facecam is a SMALL rectangular window in ONE corner (top-left, top-right,
+bottom-left, or bottom-right) that contains a person's upper body/background
+(webcam feed). It is NOT just a face — it includes shoulders, chair, wall,
+mic, etc. The facecam stays in the SAME position across all frames.
+
+Your task:
+1. Identify which corner the facecam is in: "top-left", "top-right",
+   "bottom-left", or "bottom-right"
+2. Return the rectangle of the ENTIRE facecam window (including person,
+   shoulders, chair, wall, mic, background) as normalized coordinates:
+   {x, y, w, h} where each value is 0-1 relative to frame width/height
+3. The rectangle should enclose the ENTIRE camera feed — person's head,
+   shoulders, torso, chair, wall behind them, mic, etc. NOT just the face.
+4. Assess confidence (0-1) and whether the facecam position is stable across
+   all sampled frames (is_stable: true/false).
+
+IMPORTANT:
+- The facecam is typically 15-35% of frame width and 20-40% of frame height
+- It is anchored to ONE corner and does NOT move between frames
+- Do NOT confuse it with: game UI elements, minimaps, scoreboards, kill feeds,
+  picture-in-picture that moves, or the main gameplay
+- If unsure or no clear facecam, return low confidence and is_stable: false
+
+Return JSON with: {x, y, w, h, confidence, corner, is_stable}
+All coordinates normalized 0-1 (x,y = top-left; w,h = width/height).
 """
 
 
@@ -528,11 +604,52 @@ def _config_for_strategy(strategy: str, mode: str, model_name: str) -> genai_typ
     return genai_types.GenerateContentConfig(**kwargs)
 
 
+def detect_facecam_window(video_path: str, video_duration: float, api_key: str, model_name: str = "gemini-2.5-flash") -> dict:
+    """Detect the facecam window rectangle using Gemini vision.
+    
+    Returns dict with: x, y, w, h (normalized 0-1), confidence, corner, is_stable
+    Returns None on failure.
+    """
+    from layout_picker import sample_frames
+    from google import genai
+    from google.genai import types as genai_types
+    
+    frames = sample_frames(video_path, n=12, width=1024)
+    if not frames:
+        return None
+    
+    client = genai.Client(api_key=api_key)
+    parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in frames]
+    
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=parts + [FACECAM_DETECTION_PROMPT],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=FacecamDetectionResponse,
+            ))
+        gemini_worker.raise_if_blocked(response)
+        answer = json.loads(response.text) or {}
+        
+        # Validate the response
+        required_keys = ["x", "y", "w", "h", "confidence", "corner", "is_stable"]
+        if all(k in answer for k in required_keys):
+            # Validate coordinate ranges
+            if all(0 <= answer[k] <= 1 for k in ["x", "y", "w", "h"]):
+                if 0 <= answer["confidence"] <= 1:
+                    return answer
+        return None
+    except Exception as e:
+        print(f"   ⚠️ Facecam detection failed ({e})")
+        return None
+
+
 def main() -> int:
     _configure_stdio()
 
-    parser = argparse.ArgumentParser(description="Run a single Gemini request for clip scoring/detailing.")
-    parser.add_argument("--mode", choices=["score", "detail"], required=True)
+    parser = argparse.ArgumentParser(description="Run a single Gemini request for clip scoring/detailing/facecam detection.")
+    parser.add_argument("--mode", choices=["score", "detail", "facecam"], required=True)
     parser.add_argument("--input", dest="input_path", required=True)
     parser.add_argument("--output", dest="output_path", required=True)
     parser.add_argument("--strategy", default="structured-schema")
@@ -548,9 +665,31 @@ def main() -> int:
 
     model_name = args.model
     client = genai.Client(api_key=api_key)
-    config = _config_for_strategy(args.strategy, args.mode, model_name)
     language = str(payload.get("language") or "unknown")
 
+    # Handle facecam detection mode
+    if args.mode == "facecam":
+        video_path = payload.get("video_path")
+        video_duration = float(payload.get("video_duration", 0))
+        if not video_path or video_duration <= 0:
+            raise SystemExit("facecam mode requires video_path and video_duration in payload")
+        
+        print(f"🎯 Detecting facecam window in {video_path}…")
+        result_data = detect_facecam_window(video_path, video_duration, api_key, model_name)
+        
+        result = {
+            "mode": args.mode,
+            "payload": result_data,
+            "cost_analysis": None,
+            "raw_text": "",
+        }
+        with open(args.output_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        _log(f"✅ Gemini worker success: mode={args.mode}")
+        return 0
+
+    # Original score/detail modes
+    config = _config_for_strategy(args.strategy, args.mode, model_name)
     template = SCORE_PROMPT_TEMPLATE if args.mode == "score" else DETAIL_PROMPT_TEMPLATE
     fmt = {
         "video_duration": payload["video_duration"],
@@ -558,9 +697,6 @@ def main() -> int:
         "windows_json": json.dumps(payload["windows"], ensure_ascii=False),
     }
     if args.mode != "score":
-        # Score mode receives every window, not a shortlist, so a count target
-        # derived from it would be meaningless — and the score template has no
-        # placeholder for one anyway.
         fmt["min_clips"], fmt["max_clips"] = clip_count_targets(len(payload.get("windows") or []))
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
     prompt = template.format(**fmt)

@@ -590,7 +590,7 @@ def _transcribe_with_groq(media_path):
         done = 0.0
         for path, offset in parts:
             payload = _groq_transcribe_file(path, language=language)
-            language = language or payload.get("language")
+            language = language or _normalize_language(payload.get("language"))
             transcript = _groq_payload_to_transcript(payload, offset=offset)
             segments.extend(transcript["segments"])
             text_parts.append(transcript["text"])

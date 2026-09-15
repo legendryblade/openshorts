@@ -43,6 +43,9 @@ by hand wins: this only ever ADDS, so an explicit choice is never overridden.
 """
 import json
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # AUTO_LAYOUT=1 decides and applies. AUTO_LAYOUT=shadow decides, logs, and
 # applies NOTHING: the render is byte-for-byte what it would have been.
@@ -56,6 +59,12 @@ _MODE = os.environ.get("AUTO_LAYOUT", "0").strip().lower()
 SHADOW = _MODE == "shadow"
 ENABLED = _MODE == "1" or SHADOW
 
+# The layout decision for the current SOURCE video, set by pick_and_apply().
+# Renderers read this to add whole-video layouts (gaming_split) that are
+# per-video material properties, not per-scene upgrades. It is stored on the
+# module so it survives imports; callers must reset it between jobs.
+DECISION = "none"
+
 # 12 frames at 1024px wide. Both numbers are measured, not guessed: see above.
 SAMPLE_FRAMES = int(os.environ.get("LAYOUT_SAMPLE_FRAMES", "12"))
 SAMPLE_WIDTH = int(os.environ.get("LAYOUT_SAMPLE_WIDTH", "1024"))
@@ -65,6 +74,7 @@ DECISION_FLAGS = {
     "none": [],
     "screencast": ["screencast_layout"],
     "split": ["split_layout", "active_speaker"],
+    "gaming_split": ["gaming_split_layout", "facecam_extractor"],
 }
 
 VALID = set(DECISION_FLAGS)
@@ -85,10 +95,12 @@ def apply(decision):
     import active_speaker
     import screencast_layout
     import split_layout
+    import facecam_extractor  # NEW: for gaming_split
 
     modules = {"split_layout": split_layout,
                "screencast_layout": screencast_layout,
-               "active_speaker": active_speaker}
+               "active_speaker": active_speaker,
+               "facecam_extractor": facecam_extractor}
 
     touched = []
     for name in _module_flags(decision):
@@ -183,7 +195,9 @@ def pick(video_path, video_duration):
 
 def pick_and_apply(video_path, video_duration):
     """Decide, switch on (unless shadowing), report what changed."""
+    global DECISION
     decision = pick(video_path, video_duration)
+    DECISION = decision
 
     if SHADOW:
         # One greppable line per job. Deliberately not routed through the

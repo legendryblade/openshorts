@@ -289,3 +289,98 @@ def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
         f"[withscreen][cam]overlay=x=0:y={filler_h // 2 + screen_h},"
         f"setsar=1[v]"
     )
+
+
+# --- gaming_split layout: gameplay + facecam PiP composition ---
+# Facecam takes ~25% of output height, positioned at top or bottom
+GAMING_SPLIT_CAMERA_RATIO = 0.25
+# HUD safe margin - don't crop within this margin of edges
+HUD_SAFE_MARGIN = 0.08
+
+
+def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect, facecam_dest="bottom", gameplay_crop="auto"):
+    """
+    Gaming split layout: full gameplay (minus facecam area) + facecam PiP overlay.
+    
+    Args:
+        orig_w, orig_h: source dimensions
+        out_w, out_h: output dimensions (e.g., 1080x1920)
+        facecam_rect: (x, y, w, h) tuple OR {x, y, w, h} dict in SOURCE pixels - the facecam window
+        facecam_dest: "top" or "bottom" - where to place facecam PiP panel
+        gameplay_crop: "horizontal", "vertical", or "auto"
+    
+    Composition:
+    - Gameplay layer: source with facecam area cropped out, scaled to gameplay panel
+    - Facecam layer: extracted from facecam_rect, scaled proportionally, placed as PiP
+    - Output: 1080x1920 with facecam panel at top or bottom
+    """
+    # Handle both dict and tuple formats
+    if isinstance(facecam_rect, dict):
+        fx, fy, fw, fh = facecam_rect['x'], facecam_rect['y'], facecam_rect['w'], facecam_rect['h']
+    else:
+        fx, fy, fw, fh = facecam_rect
+    x, y, w, h = int(fx), int(fy), int(fw), int(fh)
+    
+    # Facecam destination panel - 25% of output height
+    cam_panel_h = int(out_h * GAMING_SPLIT_CAMERA_RATIO)
+    cam_panel_h -= cam_panel_h % 2
+    
+    # Facecam aspect ratio
+    cam_aspect = fw / fh
+    cam_w = int(cam_panel_h * cam_aspect)
+    cam_w -= cam_w % 2
+    cam_w = min(cam_w, out_w)
+    
+    # Position facecam panel
+    if facecam_dest == "top":
+        cam_panel_y = 0
+        gameplay_panel_y = cam_panel_h
+    else:  # bottom
+        cam_panel_y = out_h - cam_panel_h
+        gameplay_panel_y = 0
+    
+    cam_x = (out_w - cam_w) // 2
+    gameplay_panel_h = out_h - cam_panel_h
+    gameplay_panel_h -= gameplay_panel_h % 2
+    
+    # Gameplay source: crop out the facecam area (bottom strip if facecam is at bottom)
+    # Facecam is typically in bottom-right corner for gaming
+    # We crop the bottom strip containing the facecam
+    facecam_bottom = y + h
+    gameplay_src_h = facecam_bottom - int(h * 0.1)  # keep some margin below facecam
+    if gameplay_src_h < orig_h * 0.5:
+        # If facecam is very low, just use most of the frame
+        gameplay_src_h = orig_h - int(orig_h * 0.1)
+    
+    # Gameplay scales to fill the gameplay panel (bottom 75% of output)
+    gameplay_panel_h = out_h - int(out_h * GAMING_SPLIT_CAMERA_RATIO)
+    gameplay_panel_h -= gameplay_panel_h % 2
+    
+    # Facecam PiP size (preserve aspect ratio)
+    cam_scale = min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh)
+    cam_scaled_w = int(fw * cam_scale)
+    cam_scaled_h = int(fh * cam_scale)
+    cam_scaled_w -= cam_scaled_w % 2
+    cam_scaled_h -= cam_scaled_h % 2
+    
+    # Facecam position in output (centered horizontally)
+    cam_out_x = (out_w - int(fw * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))) // 2
+    cam_out_y = out_h - int(out_h * GAMING_SPLIT_CAMERA_RATIO)
+    
+    return (
+        f"[0:v]split=3[bga][ga][ca];"
+        # Background: blurred full frame (fallback)
+        f"[bga]scale=-2:{out_h},crop=w=min(iw\\,{out_w}):h={out_h},"
+        f"scale={out_w}:{out_h},gblur=sigma=14[bg];"
+        # Gameplay: crop out facecam area (bottom portion), scale to gameplay panel
+        f"[ga]crop=w={orig_w}:h={int(orig_h * 0.85)}:x=0:y=0,"
+        f"scale={out_w}:{out_h - int(out_h * 0.25)}[gameplay];"
+        # Facecam: extract from source corner, scale to PiP size
+        f"[ca]crop=w={int(fw)}:h={int(fh)}:x={int(fx)}:y={int(fy)},"
+        f"scale={int(fw * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))}:"
+        f"{int(fh * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))}[facecam];"
+        # Compose: background -> gameplay -> facecam
+        f"[bg][gameplay]overlay=x=0:y={int(out_h * 0.25)}[withgame];"
+        f"[withgame][facecam]overlay=x={(out_w - int(fw * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))) // 2}:"
+        f"y={out_h - int(out_h * GAMING_SPLIT_CAMERA_RATIO)},setsar=1[v]"
+    )
