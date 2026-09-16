@@ -294,103 +294,123 @@ def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
 # --- gaming_split layout: gameplay + facecam PiP composition ---
 # Facecam takes ~25% of output height, positioned at top or bottom
 GAMING_SPLIT_CAMERA_RATIO = 0.25
+# Below this kept fraction of the frame, strip-removal is not worth it —
+# the gameplay keeps the full frame and the PiP is skipped instead.
+GAMING_SPLIT_MIN_KEEP = float(os.environ.get("GAMING_SPLIT_MIN_KEEP", "0.35"))
 # HUD safe margin - don't crop within this margin of edges
 HUD_SAFE_MARGIN = 0.08
 
 
-def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect, facecam_dest="bottom", gameplay_crop="auto"):
+def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
+                             facecam_dest="bottom", gameplay_crop="auto"):
+    """Gameplay panel + facecam PiP panel, both cropped from the same source.
+
+    The gameplay crop EXCLUDES the facecam window — a corner cam forces the
+    removal of a full strip (horizontal or vertical); the strip that retains
+    more of the frame wins, so the HUD rows beside the cam survive. Both
+    layers are scaled uniformly and centred in their panels: a direct
+    scale-to-panel stretched a 4:3 keep into a 9:16 slot, which read as
+    distortion on faces (17-sep-2026).
+
+    If the cam window is so large that either strip-removal keeps under
+    GAMING_SPLIT_MIN_KEEP of the frame, the gameplay keeps the FULL frame and
+    the PiP is skipped — a small visible cam in the gameplay beats a stretched
+    crop or a duplicated cam (the 16-sep GTA clips showed the cam twice: once
+    in the 'cropped' gameplay, once in the PiP, because the crop ignored the
+    rect).
+
+    facecam_rect: normalized dict {x,y,w,h} (detector shape) or pixel tuple.
+    facecam_dest: which output edge the PiP panel sits at.
+    gameplay_crop: "horizontal" | "vertical" | "auto" (auto = larger keep wins).
     """
-    Gaming split layout: full gameplay (minus facecam area) + facecam PiP overlay.
-    
-    Args:
-        orig_w, orig_h: source dimensions
-        out_w, out_h: output dimensions (e.g., 1080x1920)
-        facecam_rect: the facecam window as a dict with NORMALIZED coords
-            (0-1 fractions of the frame, the shape facecam_extractor returns)
-            or a plain (x, y, w, h) tuple in SOURCE pixels
-        facecam_dest: "top" or "bottom" - where to place facecam PiP panel
-        gameplay_crop: "horizontal", "vertical", or "auto"
-    
-    Composition:
-    - Gameplay layer: source with facecam area cropped out, scaled to gameplay panel
-    - Facecam layer: extracted from facecam_rect, scaled proportionally, placed as PiP
-    - Output: 1080x1920 with facecam panel at top or bottom
-    """
-    # Handle both dict and tuple formats
     if isinstance(facecam_rect, dict):
-        fx, fy, fw, fh = facecam_rect['x'], facecam_rect['y'], facecam_rect['w'], facecam_rect['h']
+        fx, fy, fw, fh = (facecam_rect['x'], facecam_rect['y'],
+                          facecam_rect['w'], facecam_rect['h'])
     else:
         fx, fy, fw, fh = facecam_rect
     # Normalized input (detector output) is scaled to source pixels; a rect in
     # source pixels passes through. Above 1.0 can only be pixels, since a
-    # fraction of a frame never exceeds 1. Feeding the detector's 0.23 straight
-    # to int() made crop=w=0:h=0, and ffmpeg died with STATUS_INVALID_USER_STACK
-    # on every clip of the GTA run — silently, each one then falling back to the
-    # v1 frame loop (16-sep-2026).
-    if fw <= 1.0:
+    # fraction of a frame never exceeds 1.
+    if 0.0 < fw <= 1.0:
         fx, fy, fw, fh = fx * orig_w, fy * orig_h, fw * orig_w, fh * orig_h
-    x, y, w, h = int(fx), int(fy), int(fw), int(fh)
-    
-    # Facecam destination panel - 25% of output height
-    cam_panel_h = int(out_h * GAMING_SPLIT_CAMERA_RATIO)
-    cam_panel_h -= cam_panel_h % 2
-    
-    # Facecam aspect ratio
-    cam_aspect = fw / fh
-    cam_w = int(cam_panel_h * cam_aspect)
-    cam_w -= cam_w % 2
-    cam_w = min(cam_w, out_w)
-    
-    # Position facecam panel
-    if facecam_dest == "top":
-        cam_panel_y = 0
-        gameplay_panel_y = cam_panel_h
-    else:  # bottom
-        cam_panel_y = out_h - cam_panel_h
-        gameplay_panel_y = 0
-    
-    cam_x = (out_w - cam_w) // 2
-    gameplay_panel_h = out_h - cam_panel_h
-    gameplay_panel_h -= gameplay_panel_h % 2
-    
-    # Gameplay source: crop out the facecam area (bottom strip if facecam is at bottom)
-    # Facecam is typically in bottom-right corner for gaming
-    # We crop the bottom strip containing the facecam
-    facecam_bottom = y + h
-    gameplay_src_h = facecam_bottom - int(h * 0.1)  # keep some margin below facecam
-    if gameplay_src_h < orig_h * 0.5:
-        # If facecam is very low, just use most of the frame
-        gameplay_src_h = orig_h - int(orig_h * 0.1)
-    
-    # Gameplay scales to fill the gameplay panel (bottom 75% of output)
-    gameplay_panel_h = out_h - int(out_h * GAMING_SPLIT_CAMERA_RATIO)
-    gameplay_panel_h -= gameplay_panel_h % 2
-    
-    # Facecam PiP size (preserve aspect ratio)
-    cam_scale = min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh)
-    cam_scaled_w = int(fw * cam_scale)
-    cam_scaled_h = int(fh * cam_scale)
-    cam_scaled_w -= cam_scaled_w % 2
-    cam_scaled_h -= cam_scaled_h % 2
-    
-    # Facecam position in output (centered horizontally)
-    cam_out_x = (out_w - int(fw * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))) // 2
-    cam_out_y = out_h - int(out_h * GAMING_SPLIT_CAMERA_RATIO)
-    
-    return (
-        f"[0:v]split=3[bga][ga][ca];"
-        # Background: blurred full frame (fallback)
-        f"[bga]scale=-2:{out_h},crop=w=min(iw\\,{out_w}):h={out_h},"
-        f"scale={out_w}:{out_h},gblur=sigma=14[bg];"
-        # Gameplay: crop out facecam area (bottom portion), scale to gameplay panel
-        f"[ga]crop=w={orig_w}:h={int(orig_h * 0.85)}:x=0:y=0,"
-        f"scale={out_w}:{out_h - int(out_h * 0.25)}[gameplay];"
-        # Facecam: extract from source corner, scale to PiP size
-        f"[ca]crop=w={int(fw)}:h={int(fh)}:x={int(fx)}:y={int(fy)},"
-        f"scale={int(fw * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))}:"
-        f"{int(fh * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))}[facecam];"
-        # Compose: background -> gameplay -> facecam
-        f"[bg][gameplay]overlay=x=0:y={int(out_h * 0.25)}[withgame];"
-        f"[withgame][facecam]overlay=x={(out_w - int(fw * min(out_w / fw, (out_h * GAMING_SPLIT_CAMERA_RATIO) / fh))) // 2}:"
-        f"y={out_h - int(out_h * GAMING_SPLIT_CAMERA_RATIO)},setsar=1[v]"
-    )
+
+    def _even(v):
+        return max(2, int(v) - (int(v) % 2))
+
+    x = max(0, min(int(fx), orig_w - 2))
+    y = max(0, min(int(fy), orig_h - 2))
+    w = _even(min(max(fw, 2), orig_w - x))
+    h = _even(min(max(fh, 2), orig_h - y))
+
+    # Cam panel occupies the bottom (or top) GAMING_SPLIT_CAMERA_RATIO band.
+    cam_panel_h = _even(out_h * GAMING_SPLIT_CAMERA_RATIO)
+    gp_panel_h = _even(out_h - cam_panel_h)
+    gp_panel_y = 0 if facecam_dest == "bottom" else cam_panel_h
+    cam_panel_y = out_h - cam_panel_h if facecam_dest == "bottom" else 0
+
+    # Two strip-removal candidates for the gameplay keep-rect.
+    keep_h = (0, 0, orig_w, y) if y > 0 else None                    # below-cam kept
+    keep_h2 = (0, y + h, orig_w, orig_h - (y + h)) if y + h < orig_h else None
+    keep_v = (0, 0, x, orig_h) if x > 0 else None                    # left of cam kept
+    keep_v2 = (x + w, 0, orig_w - (x + w), orig_h) if x + w < orig_w else None
+
+    horiz_opts = [k for k in (keep_h, keep_h2) if k and k[2] >= 4 and k[3] >= 4]
+    vert_opts = [k for k in (keep_v, keep_v2) if k and k[2] >= 4 and k[3] >= 4]
+    best_h = max(horiz_opts, key=lambda k: k[2] * k[3]) if horiz_opts else None
+    best_v = max(vert_opts, key=lambda k: k[2] * k[3]) if vert_opts else None
+
+    choice = (gameplay_crop or "auto").strip().lower()
+    if choice == "horizontal" and best_h:
+        keep = best_h
+    elif choice == "vertical" and best_v:
+        keep = best_v
+    else:
+        # Auto: whichever strip keeps more of the frame; none -> full frame.
+        cands = [k for k in (best_h, best_v) if k]
+        keep = (max(cands, key=lambda k: k[2] * k[3])
+                if cands else (0, 0, orig_w, orig_h))
+
+    # Fallback: if the best keep loses too much of the frame, keep the FULL
+    # frame and drop the PiP — a small cam in the gameplay is less wrong than
+    # a cropped-to-death gameplay or a duplicated cam.
+    keep_frac = (keep[2] * keep[3]) / float(orig_w * orig_h)
+    pip = keep_frac >= GAMING_SPLIT_MIN_KEEP
+
+    if pip:
+        gp_scale = min(out_w / float(keep[2]), gp_panel_h / float(keep[3]))
+        gp_w = _even(keep[2] * gp_scale)
+        gp_h = _even(keep[3] * gp_scale)
+        gp_x = (out_w - gp_w) // 2
+        gp_y = gp_panel_y + (gp_panel_h - gp_h) // 2
+
+        cam_scale = min(out_w / float(w), cam_panel_h / float(h))
+        cam_w = _even(w * cam_scale)
+        cam_h = _even(h * cam_scale)
+        cam_x = (out_w - cam_w) // 2
+        cam_y = cam_panel_y + (cam_panel_h - cam_h) // 2
+
+        graph = (
+            f"[0:v]split=3[bga][ga][ca];"
+            f"[bga]scale=-2:{out_h},crop=w=min(iw\,{out_w}):h={out_h},"
+            f"scale={out_w}:{out_h},gblur=sigma=14[bg];"
+            f"[ga]crop=w={keep[2]}:h={keep[3]}:x={keep[0]}:y={keep[1]},"
+            f"scale={gp_w}:{gp_h}[gameplay];"
+            f"[ca]crop=w={w}:h={h}:x={x}:y={y},"
+            f"scale={cam_w}:{cam_h}[facecam];"
+            f"[bg][gameplay]overlay=x={gp_x}:y={gp_y}[withgame];"
+            f"[withgame][facecam]overlay=x={cam_x}:y={cam_y},setsar=1[v]"
+        )
+    else:
+        gp_scale = min(out_w / float(orig_w), out_h / float(orig_h))
+        gp_w = _even(orig_w * gp_scale)
+        gp_h = _even(orig_h * gp_scale)
+        gp_x = (out_w - gp_w) // 2
+        gp_y = (out_h - gp_h) // 2
+        graph = (
+            f"[0:v]split=2[bga][ga];"
+            f"[bga]scale=-2:{out_h},crop=w=min(iw\,{out_w}):h={out_h},"
+            f"scale={out_w}:{out_h},gblur=sigma=14[bg];"
+            f"[ga]scale={gp_w}:{gp_h}[gameplay];"
+            f"[bg][gameplay]overlay=x={gp_x}:y={gp_y},setsar=1[v]"
+        )
+    return graph

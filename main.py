@@ -2206,6 +2206,27 @@ if __name__ == '__main__':
                         captioned = auto_caption_clip(
                             deliver_path, transcript, start, end,
                             split_ranges=_layouts.split_ranges(clip['layout_ranges']))
+                        # Quality gate: six frames of the FINISHED short to a
+                        # vision checklist (facecam once, gameplay readable,
+                        # captions non-blocking). A fail re-renders once with
+                        # the known-good WIDE layout and re-burns captions;
+                        # the second verdict is final. Unavailable gate = pass.
+                        import critique_gate
+                        final_deliver = captioned or deliver_path
+                        if critique_gate.ENABLED:
+                            def _redo_simple():
+                                ok2 = render_clip(clip_temp_path, clip_final_path,
+                                                  output_format, force_strategy='WIDE')
+                                if not ok2:
+                                    raise RuntimeError("fallback re-render returned failure")
+                                cap2 = auto_caption_clip(
+                                    clip_final_path, transcript, start, end,
+                                    split_ranges=[])
+                                if cap2:
+                                    # Mirror deliver_path: the captioned file
+                                    # replaces the canonical one on success.
+                                    os.replace(cap2, clip_final_path)
+                            critique_gate.gate(final_deliver, redo_fn=_redo_simple)
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
                         # Hand the API the file to actually serve for this clip.
                         # Without it the status poller guesses the clean reframe
