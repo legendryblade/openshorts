@@ -369,6 +369,8 @@ def detect_for_source(video_path: str, use_gemini: bool = True) -> Optional[Dict
     SOURCE_FACECAM so every clip cut from this source reuses the same rect.
     """
     global SOURCE_FACECAM
-    rect = detect_facecam_window(video_path, use_gemini=use_gemini)
+    rect = detect_facecam_window(
+        video_path, use_gemini=use_gemini,
+        gemini_api_key=os.getenv("GEMINI_API_KEY"))
     SOURCE_FACECAM = rect
     return rect
