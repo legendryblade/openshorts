@@ -311,14 +311,34 @@ def _identify_corner(box: List[int], frame_w: int, frame_h: int) -> Optional[str
 
 
 def _validate_facecam_size(box: List[int], frame_w: int, frame_h: int) -> bool:
-    """Validate facecam box is reasonable size for a webcam window."""
+    """Validate facecam box is reasonable size for a webcam window.
+
+    A composited camera window is ALWAYS anchored to two frame edges — an
+    OBS/webcam overlay is pinned to a corner and grows inward. A candidate
+    floating in the middle of the frame (a game character, an NPC) touches
+    neither edge and is rejected here. Measured on the GTA source: the real
+    facecam sits at x+w=1.0, y+h=1.0 (touches right + bottom), while the
+    strongest false positive (a character at x=0.23, y=0.51) touches nothing.
+    """
     x, y, w, h = box
     w_frac = w / frame_w
     h_frac = h / frame_h
-    
+
     if not (FACECAM_MIN_W <= w_frac <= FACECAM_MAX_W):
         return False
     if not (FACECAM_MIN_H <= h_frac <= FACECAM_MAX_H):
+        return False
+
+    # Corner-anchor gate: the box must reach within EDGE_TOLERANCE of two
+    # opposite frame edges (one horizontal, one vertical).
+    EDGE_TOLERANCE = 0.12
+    touches_left = x / frame_w <= EDGE_TOLERANCE
+    touches_right = (x + w) / frame_w >= 1.0 - EDGE_TOLERANCE
+    touches_top = y / frame_h <= EDGE_TOLERANCE
+    touches_bottom = (y + h) / frame_h >= 1.0 - EDGE_TOLERANCE
+    touches_horizontal_edge = touches_left or touches_right
+    touches_vertical_edge = touches_top or touches_bottom
+    if not (touches_horizontal_edge and touches_vertical_edge):
         return False
     return True
 
@@ -333,3 +353,22 @@ def _rects_match(r1: Dict, r2: Dict, threshold: float = 0.15) -> bool:
 
 # Re-export for compatibility
 ENABLED = True
+
+# Facecam rectangle for the CURRENT SOURCE video, detected once in main.py and
+# reused by the renderer for every clip cut from that source. The renderer
+# receives per-clip temp files whose paths (and sizes) differ from the source,
+# so a per-clip cache lookup would miss and re-detect on a weaker signal.
+# Callers must reset this between jobs.
+SOURCE_FACECAM: Optional[Dict] = None
+
+
+def detect_for_source(video_path: str, use_gemini: bool = True) -> Optional[Dict]:
+    """Detect the facecam once for a source video and remember it.
+
+    The result is cached both on disk (keyed by the source file) and in
+    SOURCE_FACECAM so every clip cut from this source reuses the same rect.
+    """
+    global SOURCE_FACECAM
+    rect = detect_facecam_window(video_path, use_gemini=use_gemini)
+    SOURCE_FACECAM = rect
+    return rect

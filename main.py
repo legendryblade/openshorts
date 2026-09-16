@@ -2047,6 +2047,23 @@ if __name__ == '__main__':
                 print(f"   ↕️  Source is {_w}x{_h} — already vertical, no layout to pick.")
             else:
                 layout_picker.pick_and_apply(input_video, _duration)
+                # Gaming split needs the facecam rect of the SOURCE video.
+                # Detected once here (keyed by the source file) and reused for
+                # every clip — per-clip temp files would miss the cache and
+                # fall back to weaker local detection on busy gameplay.
+                if layout_picker.DECISION == "gaming_split":
+                    import facecam_extractor
+                    try:
+                        rect = facecam_extractor.detect_for_source(input_video)
+                        if rect:
+                            print(f"   📹 Source facecam locked: {rect['corner']} "
+                                  f"({rect['x']:.2f},{rect['y']:.2f} "
+                                  f"{rect['w']:.2f}x{rect['h']:.2f}, "
+                                  f"conf {rect['confidence']:.2f})")
+                        else:
+                            print("   ⚠️ No facecam found on source — clips will fall back to SCREENCAST")
+                    except Exception as e:
+                        print(f"   ⚠️ Source facecam detection failed ({e})")
         except Exception as e:
             print(f"⚠️ Layout choice skipped ({e}) — using the default layout.")
 

@@ -502,17 +502,24 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
 
     # Gaming split: detect the facecam window once for the whole video. The
     # result is normalized (0-1) coords plus corner/stability; the render
-    # converts to source pixels inside the filtergraph builder.
+    # converts to source pixels inside the filtergraph builder. The rect from
+    # the SOURCE video (set by main.detect_for_source) wins: the input here is
+    # a short per-clip temp cut, on which the detector's cache misses and the
+    # weaker local fallback can lock onto a game character instead of the cam.
     facecam_rect = None
     if gaming_layout:
         strategies = ['GAMING_SPLIT'] * len(strategies)
         content_ranges = []
         splits.clear()
         print("   🎮 Gaming split layout: whole video (facecam + gameplay)")
-        try:
-            facecam_rect = facecam_extractor.detect_facecam_window(input_video)
-        except Exception as e:
-            print(f"   ⚠️ Facecam detection failed ({e})")
+        facecam_rect = getattr(facecam_extractor, "SOURCE_FACECAM", None)
+        if facecam_rect:
+            print("   📹 Using source-level facecam rect (shared across clips)")
+        else:
+            try:
+                facecam_rect = facecam_extractor.detect_facecam_window(input_video)
+            except Exception as e:
+                print(f"   ⚠️ Facecam detection failed ({e})")
         if facecam_rect:
             print(f"   📹 Facecam window: {facecam_rect['corner']} "
                   f"({facecam_rect['x']:.2f},{facecam_rect['y']:.2f} "
