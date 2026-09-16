@@ -24,6 +24,7 @@ import tempfile
 import active_speaker
 import camera_inset
 import facecam_extractor
+import filtergraph_guard
 import layout_picker
 import punch_in
 import screencast_layout
@@ -613,6 +614,24 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                     f"crop@c={init},"
                     f"scale={out_w}:{out_h},setsar=1[v]"
                 )
+
+            # The graph is checked while it is still a string. Before this, a
+            # bad value reached ffmpeg and killed the process natively — exit
+            # -1073741810, no traceback, and nothing in the log naming the
+            # layout or the option at fault (15-sep prod, every gaming clip).
+            # A scene whose graph cannot render now falls back to the blurred
+            # layout, which is a frame the user can still post, instead of
+            # costing them the entire clip.
+            problems = filtergraph_guard.problems(graph, require_output_label=True)
+            if problems:
+                print(f"   ⚠️ {strategy} graph rejected: {'; '.join(problems)} — "
+                      f"rendering this scene as WIDE instead")
+                graph = general_filtergraph(out_w, out_h,
+                                            orig_w=orig_w, orig_h=orig_h)
+                # A fallback that is broken too must fail loudly: a half
+                # rendered clip is worse than the v1 engine, which the caller
+                # reaches when this raises.
+                filtergraph_guard.validate(graph, require_output_label=True)
 
             _run([
                 "ffmpeg", "-y", "-loglevel", "error",
