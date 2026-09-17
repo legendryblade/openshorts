@@ -297,12 +297,16 @@ GAMING_SPLIT_CAMERA_RATIO = 0.25
 # Below this kept fraction of the frame, strip-removal is not worth it —
 # the gameplay keeps the full frame and the PiP is skipped instead.
 GAMING_SPLIT_MIN_KEEP = float(os.environ.get("GAMING_SPLIT_MIN_KEEP", "0.35"))
+# Bottom band reserved for burned captions (OpusClip pattern: cam top,
+# gameplay middle, captions bottom). The gameplay panel ends above it so
+# default bottom-center captions never cover the cam or the action.
+GAMING_SPLIT_CAPTION_RATIO = float(os.environ.get("GAMING_SPLIT_CAPTION_RATIO", "0.18"))
 # HUD safe margin - don't crop within this margin of edges
 HUD_SAFE_MARGIN = 0.08
 
 
 def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
-                             facecam_dest="bottom", gameplay_crop="auto"):
+                             facecam_dest="top", gameplay_crop="auto"):
     """Gameplay panel + facecam PiP panel, both cropped from the same source.
 
     The gameplay crop EXCLUDES the facecam window — a corner cam forces the
@@ -342,11 +346,13 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
     w = _even(min(max(fw, 2), orig_w - x))
     h = _even(min(max(fh, 2), orig_h - y))
 
-    # Cam panel occupies the bottom (or top) GAMING_SPLIT_CAMERA_RATIO band.
+    # Panels: cam band at the top, gameplay in the middle, bottom band kept
+    # free for burned captions (see GAMING_SPLIT_CAPTION_RATIO).
     cam_panel_h = _even(out_h * GAMING_SPLIT_CAMERA_RATIO)
-    gp_panel_h = _even(out_h - cam_panel_h)
-    gp_panel_y = 0 if facecam_dest == "bottom" else cam_panel_h
-    cam_panel_y = out_h - cam_panel_h if facecam_dest == "bottom" else 0
+    caption_h = _even(out_h * GAMING_SPLIT_CAPTION_RATIO)
+    gp_panel_y = cam_panel_h if facecam_dest == "top" else 0
+    gp_panel_h = _even(out_h - cam_panel_h - caption_h)
+    cam_panel_y = 0 if facecam_dest == "top" else (out_h - cam_panel_h)
 
     # Two strip-removal candidates for the gameplay keep-rect.
     keep_h = (0, 0, orig_w, y) if y > 0 else None                    # below-cam kept
@@ -401,11 +407,11 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
             f"[withgame][facecam]overlay=x={cam_x}:y={cam_y},setsar=1[v]"
         )
     else:
-        gp_scale = min(out_w / float(orig_w), out_h / float(orig_h))
+        gp_scale = min(out_w / float(orig_w), gp_panel_h / float(orig_h))
         gp_w = _even(orig_w * gp_scale)
         gp_h = _even(orig_h * gp_scale)
         gp_x = (out_w - gp_w) // 2
-        gp_y = (out_h - gp_h) // 2
+        gp_y = gp_panel_y + (gp_panel_h - gp_h) // 2
         graph = (
             f"[0:v]split=2[bga][ga];"
             f"[bga]scale=-2:{out_h},crop=w=min(iw\,{out_w}):h={out_h},"
