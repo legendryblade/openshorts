@@ -226,7 +226,11 @@ def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, ma
 # and Reels' own bottom UI — the caption/username block and the music ticker —
 # where they were partly covered on the platform even though the exported file
 # looked fine.
-SAFE_MARGIN_V = 43
+# CAPTION_MARGIN_V overrides it per deployment. The gaming-split layout
+# reserves a blurred bottom band for captions, so a smaller margin (text sits
+# lower, deeper into that band) reads better there without covering gameplay;
+# 32/288 = ~11% from the bottom edge.
+SAFE_MARGIN_V = int(os.environ.get("CAPTION_MARGIN_V", "43"))
 
 
 # The caption look applied automatically to every generated clip. Chosen by
@@ -263,6 +267,15 @@ def _ass_time(seconds):
     if centis >= 100:
         centis = 99
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def _ass_seconds(timestamp):
+    """Parse an ASS H:MM:SS.cc timestamp back to seconds."""
+    try:
+        h, m, rest = timestamp.split(':')
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+    except (ValueError, AttributeError):
+        return 0.0
 
 
 def _hex_to_ass_inline_color(hex_color, fallback="FFFFFF"):
@@ -428,6 +441,33 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
 
     if not events:
         return False
+
+    # Serialize events globally: blocks come from separate transcript segments,
+    # and whisper segments can overlap (repeated-word hallucinations) or touch
+    # across a block boundary. Two events alive at the same moment render two
+    # full karaoke lines on top of each other — measured on the GTA source the
+    # frame read "KILLER/LITERALLY" superimposed. Clamping start to the previous
+    # event's end keeps every event's own words sequential; empty ones drop.
+    def _start(ev):
+        return ev[0]
+
+    parsed = []
+    for ev in events:
+        fields = ev.split(',', 3)
+        # fields = ["Dialogue: 0", "<start>", "<end>", "Default,,0,0,0,,<text>"]
+        parsed.append((ev, _ass_seconds(fields[1]), _ass_seconds(fields[2])))
+    parsed.sort(key=lambda item: item[1])
+    serialized = []
+    prev_end = -1.0
+    for ev, s, e in parsed:
+        s = max(s, prev_end)
+        if e <= s:
+            continue
+        fields = ev.split(',', 3)
+        ev = f"{fields[0]},{_ass_time(s)},{fields[2]},{fields[3]}"
+        serialized.append(ev)
+        prev_end = e
+    events = serialized
 
     with open(output_path, 'w', encoding='utf-8-sig') as f:
         f.write(header + "\n".join(events) + "\n")
