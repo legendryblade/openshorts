@@ -345,7 +345,7 @@ def _run(cmd):
 
 
 def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
-           force_strategy=None, crop_overrides=None):
+           force_strategy=None, crop_overrides=None, punch_ins=None):
     """Full v2 reframe of one clip. Raises on failure (caller falls back).
 
     ``content_ranges`` comes from screencast_layout.detect_content_ranges() on
@@ -592,8 +592,14 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 graph = general_filtergraph(out_w, out_h,
                                             orig_w=orig_w, orig_h=orig_h)
             elif strategy == 'GAMING_SPLIT':
+                # sendcmd timestamps are segment-relative (the render seeks
+                # per scene), so re-base the clip-relative punches into this
+                # scene's window and drop the ones outside it.
+                seg_punches = [dict(p, t=round(p['t'] - ss, 3)) for p in (punch_ins or [])
+                               if ss - 0.3 <= p['t'] < ss + dur]
                 graph = camera_inset.gaming_split_filtergraph(
-                    orig_w, orig_h, out_w, out_h, facecam_rect)
+                    orig_w, orig_h, out_w, out_h, facecam_rect,
+                    punch_ins=seg_punches, fps=fps, cmd_dir=workdir)
             else:
                 seg_xs = [x if x is not None else 0 for x in xs[start_f:end_f]]
                 cmd_path = os.path.join(workdir, f"cmd_{idx:03d}.txt")

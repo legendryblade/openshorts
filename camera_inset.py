@@ -305,8 +305,68 @@ GAMING_SPLIT_CAPTION_RATIO = float(os.environ.get("GAMING_SPLIT_CAPTION_RATIO", 
 HUD_SAFE_MARGIN = 0.08
 
 
+def _even_box(x, y, w, h, frame_w, frame_h, min_side=2):
+    """Clamp a crop box inside the frame with even sides (encoder-safe)."""
+    w = max(min_side, min(int(w) - (int(w) % 2), frame_w))
+    h = max(min_side, min(int(h) - (int(h) % 2), frame_h))
+    x = max(0, min(int(x), frame_w - w))
+    y = max(0, min(int(y), frame_h - h))
+    return x, y, w, h
+
+
+def _zoom_sendcmd_lines(base_box, punches, fps, frame_w, frame_h, target):
+    """sendcmd lines that drive a named crop through the punch-in curve.
+
+    base_box: (x, y, w, h) the layer's resting crop, in source pixels.
+    punches: [{'t','scale','duration'}] CLIP-RELATIVE seconds, pre-validated.
+    Each punch eases to a zoomed box (base divided by scale, centred), holds,
+    and eases back — 5 steps each way reads as a deliberate push, not a cut.
+
+    Returns [] when punches is empty (no sendcmd filter is added then).
+    """
+    if not punches:
+        return []
+    lines = []
+    bx, by, bw, bh = base_box
+    STEPS = 5
+    EASE = 0.25  # seconds of attack/release on each side of the hold
+    for p in punches:
+        try:
+            t0 = max(0.0, float(p["t"]))
+            scale = float(p.get("scale", 1.3))
+            dur = float(p.get("duration", 1.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        zw, zh = bw / scale, bh / scale
+        zx = bx + (bw - zw) / 2.0
+        zy = by + (bh - zh) / 2.0
+        zx, zy, zw, zh = _even_box(zx, zy, zw, zh, frame_w, frame_h)
+
+        def _emit(ts, x, y, w, h):
+            x, y, w, h = _even_box(x, y, w, h, frame_w, frame_h)
+            lines.append(f"{ts:.3f} {target} w {w}; {ts:.3f} {target} h {h}; "
+                         f"{ts:.3f} {target} x {x}; {ts:.3f} {target} y {y};")
+
+        # ease in (base -> zoomed), hold, ease out (zoomed -> base)
+        for i in range(1, STEPS + 1):
+            f = (i / STEPS) ** 2  # quadratic ease
+            _emit(t0 - EASE + (EASE * i / STEPS),
+                  bx + (zx - bx) * f, by + (zy - by) * f,
+                  bw + (zw - bw) * f, bh + (zh - bh) * f)
+        _emit(t0 + dur, zx, zy, zw, zh)
+        for i in range(1, STEPS + 1):
+            f = 1.0 - (i / STEPS) ** 2
+            _emit(t0 + dur + (EASE * i / STEPS),
+                  bx + (zx - bx) * f, by + (zy - by) * f,
+                  bw + (zw - bw) * f, bh + (zh - bh) * f)
+    # Deduped, chronological sendcmd expects sorted timestamps per target.
+    lines.sort()
+    return lines
+
+
 def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
-                             facecam_dest="top", gameplay_crop="auto"):
+                             facecam_dest="top", gameplay_crop="auto",
+                             punch_ins=None, fps=30.0, cmd_dir=None):
     """Gameplay panel + facecam PiP panel, both cropped from the same source.
 
     The gameplay crop EXCLUDES the facecam window — a corner cam forces the
@@ -326,6 +386,15 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
     facecam_rect: normalized dict {x,y,w,h} (detector shape) or pixel tuple.
     facecam_dest: which output edge the PiP panel sits at.
     gameplay_crop: "horizontal" | "vertical" | "auto" (auto = larger keep wins).
+    punch_ins: [{"t","scale","duration","layer"}] SEGMENT-relative seconds
+        (the render seeks per scene; the caller re-bases). cam punches zoom
+        the facecam crop, gameplay punches zoom the kept gameplay crop —
+        both via sendcmd on a named crop, so the panel size stays fixed and
+        the image inside it enlarges (reaction emphasis grows the person
+        whole, never a tighter face crop).
+    fps: source frame rate, for sendcmd timestamps.
+    cmd_dir: where sendcmd command files are written (required when
+        punch_ins is non-empty).
     """
     if isinstance(facecam_rect, dict):
         fx, fy, fw, fh = (facecam_rect['x'], facecam_rect['y'],
@@ -395,13 +464,34 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
         cam_x = (out_w - cam_w) // 2
         cam_y = cam_panel_y + (cam_panel_h - cam_h) // 2
 
+        # Punch-ins drive a NAMED crop through sendcmd: the panel sizes above
+        # stay fixed and the image inside enlarges — zoom without re-layout.
+        def _punch_branch(punches, base_box, name):
+            if not punches or not cmd_dir:
+                return "", _even_box(*base_box, orig_w, orig_h)
+            import os as _os
+            lines = _zoom_sendcmd_lines(base_box, punches, fps,
+                                        orig_w, orig_h, f"crop@{name}")
+            if not lines:
+                return "", _even_box(*base_box, orig_w, orig_h)
+            path = _os.path.join(cmd_dir, f"punch_{name}.txt")
+            with open(path, "w") as f:
+                f.write(chr(10).join(lines) + chr(10))
+            from ffmpeg_utils import escape_filter_value as _efv
+            return f"sendcmd=f='{_efv(path)}',", _even_box(*base_box, orig_w, orig_h)
+
+        cam_punches = [p for p in (punch_ins or []) if p.get("layer") == "cam"]
+        gp_punches = [p for p in (punch_ins or []) if p.get("layer") == "gameplay"]
+        cam_pre, cam_base = _punch_branch(cam_punches, (x, y, w, h), "cp")
+        gp_pre, gp_base = _punch_branch(gp_punches, keep, "gp")
+
         graph = (
             f"[0:v]split=3[bga][ga][ca];"
             f"[bga]scale=-2:{out_h},crop=w=min(iw\,{out_w}):h={out_h},"
             f"scale={out_w}:{out_h},gblur=sigma=14[bg];"
-            f"[ga]crop=w={keep[2]}:h={keep[3]}:x={keep[0]}:y={keep[1]},"
+            f"[ga]{gp_pre}crop=w={gp_base[2]}:h={gp_base[3]}:x={gp_base[0]}:y={gp_base[1]},"
             f"scale={gp_w}:{gp_h}[gameplay];"
-            f"[ca]crop=w={w}:h={h}:x={x}:y={y},"
+            f"[ca]{cam_pre}crop=w={cam_base[2]}:h={cam_base[3]}:x={cam_base[0]}:y={cam_base[1]},"
             f"scale={cam_w}:{cam_h}[facecam];"
             f"[bg][gameplay]overlay=x={gp_x}:y={gp_y}[withgame];"
             f"[withgame][facecam]overlay=x={cam_x}:y={cam_y},setsar=1[v]"

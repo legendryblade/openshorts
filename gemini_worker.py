@@ -30,6 +30,14 @@ class ScoreResponse(BaseModel):
     windows: List[ScoredWindowModel]
 
 
+class PunchInModel(BaseModel):
+    t: float            # absolute seconds into the SOURCE video
+    layer: str = "cam"  # "cam" (reaction) | "gameplay" (action)
+    scale: float = 1.3  # zoom factor 1.15-1.6
+    duration: float = 1.0
+    why: str = ""
+
+
 class DetailClipModel(BaseModel):
     start: float
     end: float
@@ -39,6 +47,7 @@ class DetailClipModel(BaseModel):
     video_description_for_instagram: str
     video_title_for_youtube_short: str
     viral_hook_text: str
+    punch_ins: Optional[List[PunchInModel]] = None
 
 
 class DetailResponse(BaseModel):
@@ -402,6 +411,18 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
   without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
 - `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
 - `predicted_score`: honest 0-100 estimate of viral potential.
+- PUNCH-INS (optional, for gaming/screen videos): mark up to 3 moments per
+  clip where a short zoom adds impact, as "punch_ins":
+  {{"t": <absolute seconds>, "layer": "cam"|"gameplay", "scale": <1.2-1.5>,
+    "duration": <0.8-1.5>, "why": "<3 words>"}}
+  - layer "cam": an emotional REACTION in the speech (scream, laugh, shock) —
+    the streamer's camera panel enlarges for the beat. Anchor t to the word
+    timestamp where the reaction peaks.
+  - layer "gameplay": a visual ACTION beat (explosion, kill, near-miss, car
+    crash) — the gameplay view zooms in briefly. Anchor t to when it happens.
+  - Omit punch_ins (or return []) when nothing qualifies — a clip with zero
+    punch-ins is correct. Never two within 2s of each other, never outside
+    the clip's own start/end, never more than 3.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -419,7 +440,10 @@ Return only:
       "video_description_for_tiktok": "<description + hashtags>",
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
-      "viral_hook_text": "<short overlay max 10 words>"
+      "viral_hook_text": "<short overlay max 10 words>",
+      "punch_ins": [
+        {{"t": <seconds>, "layer": "cam"|"gameplay", "scale": <1.2-1.5>, "duration": <0.8-1.5>, "why": "<3 words>"}}
+      ]
     }}
   ]
 }}

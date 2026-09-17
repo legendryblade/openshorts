@@ -27,7 +27,8 @@ import layout_picker
 import llm_backend
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, estimate_prompt_tokens,
-                            is_daily_quota_error, snap_clip_to_words,
+                            is_daily_quota_error, refine_clip_boundaries,
+                            validate_punch_ins, snap_clip_to_words,
                             TokenPacer, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
@@ -1103,7 +1104,7 @@ def auto_hook_clip(clip_path, clip):
 
 
 def render_clip(input_video, final_output_video, output_format="auto",
-                force_strategy=None, crop_overrides=None):
+                force_strategy=None, crop_overrides=None, punch_ins=None):
     """Route a cut clip through the right renderer for the chosen output format.
     vertical/auto -> 9:16 reframe, square -> 1:1 reframe, horizontal -> keep.
     ``force_strategy`` (e.g. 'WIDE'/'TRACK') pins every scene's layout — the
@@ -1184,7 +1185,7 @@ def apply_watermark(video_path):
 
 
 def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPECT_RATIO,
-                              force_strategy=None, crop_overrides=None):
+                              force_strategy=None, crop_overrides=None, punch_ins=None):
     """
     Core logic to reframe a horizontal video to a target aspect ratio using
     scene detection and Active Speaker Tracking (MediaPipe).
@@ -1201,7 +1202,8 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
             t0 = time.time()
             result = reframe_v2.render(input_video, final_output_video, aspect_ratio,
                                        force_strategy=force_strategy,
-                                       crop_overrides=crop_overrides)
+                                       crop_overrides=crop_overrides,
+                                       punch_ins=punch_ins)
             print(f"   ⏱️ Reframe v2 total: {time.time() - t0:.1f}s")
             return result
         except Exception as e:
@@ -1819,7 +1821,20 @@ def get_viral_clips(transcript_result, video_duration):
         for s in shorts:
             ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
                                         min_duration=min_secs, max_duration=max_secs)
-            s["start"], s["end"] = ns, ne
+            rs, re_ = refine_clip_boundaries(ns, ne, words, video_duration,
+                                             min_duration=min_secs, max_duration=max_secs)
+            if (rs, re_) != (ns, ne):
+                print(f"   ✂️ Trimmed dead air: {ns:.1f}-{ne:.1f} -> {rs:.1f}-{re_:.1f} "
+                      f"({ne - ns:.0f}s -> {re_ - rs:.0f}s)")
+            s["start"], s["end"] = rs, re_
+            # Re-base the model's punch-in times onto the TRIMMED clip and
+            # keep only renderer-usable ones (in-range, spaced, clamped).
+            pins = refine_clip_boundaries and validate_punch_ins(
+                s.get('punch_ins'), rs, re_)
+            s['punch_ins'] = pins
+            if pins:
+                where = ', '.join(f"{p['t']:.1f}s/{p['layer']}" for p in pins)
+                print(f"   🔍 Punch-ins on clip: {where}")
 
         # Aggregate cost across both passes.
         cost_analysis = None
@@ -2097,6 +2112,11 @@ if __name__ == '__main__':
             try:
                 with open(args.transcript, 'r') as f:
                     transcript = json.load(f)
+                # A checkpoint file wraps the payload as {source, transcript};
+                # accept both the wrapper and the bare transcript shape.
+                if not transcript.get('segments') and isinstance(
+                        transcript.get('transcript'), dict):
+                    transcript = transcript['transcript']
                 if not transcript.get('segments'):
                     raise ValueError("transcript has no segments")
                 print(f"⏩ Reusing precomputed transcript "
@@ -2179,7 +2199,8 @@ if __name__ == '__main__':
                     ]
                     subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-                    success = render_clip(clip_temp_path, clip_final_path, output_format)
+                    success = render_clip(clip_temp_path, clip_final_path, output_format,
+                                          punch_ins=clip.get('punch_ins'))
                     # Layer order: watermark burns into the canonical (so any
                     # later hook replacement, which re-derives from it, keeps
                     # the branding), the hook is a derived hooked_ file, and

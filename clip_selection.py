@@ -261,6 +261,100 @@ def snap_clip_to_words(start, end, words, video_duration,
     return (round(new_start, 3), round(new_end, 3))
 
 
+def refine_clip_boundaries(start, end, words, video_duration,
+                           min_duration=15.0, max_duration=60.0,
+                           lead=0.4, tail=0.5, max_side_trim=0.4):
+    """Trim dead air off a snapped clip without losing setup or payoff.
+
+    snap_clip_to_words lands a cut in the pause AROUND the model's proposed
+    boundary; it never pulls the boundary INWARD. The detail pass routinely
+    proposes windows with 1.5-3s of silence before the first spoken word and
+    after the reaction — dead weight at the exact edges a swipe-happy viewer
+    judges. This keeps only a breath around the actual speech:
+
+      - new_start = first word inside the window minus `lead` (visual beat
+        before the hook), never earlier than the original start
+      - new_end   = last word inside the window plus `tail` (the reaction
+        beat), never later than the original end
+    Guards: never trim more than `max_side_trim` of the clip from either
+    side (word misdetection must not gut the clip), and never below
+    min_duration — any violated guard returns the input unchanged.
+
+    Returns (start, end) rounded to 3 decimals.
+    """
+    original = (round(float(start), 3), round(float(end), 3))
+    s, e = original
+    span = e - s
+    if span < min_duration or not words:
+        return original
+
+    inside = [w for w in words
+              if s - 0.5 <= float(w.get("s", 0)) and float(w.get("e", 0)) <= e + 0.5]
+    if not inside:
+        return original
+
+    first = min(float(w.get("s", 0)) for w in inside)
+    last = max(float(w.get("e", 0)) for w in inside)
+
+    # Each side may move inward by at most max_side_trim of the span:
+    # a word misdetection must not gut the clip from one edge.
+    lo_floor = s + span * max_side_trim      # start cannot move later than this
+    hi_ceiling = e - span * max_side_trim    # end cannot move earlier than this
+
+    new_start = min(max(s, first - lead), lo_floor)
+    new_end = max(min(e, last + tail), hi_ceiling)
+
+    if new_end - new_start < min_duration:
+        return original
+    if new_end <= new_start or new_start < 0 or new_end > video_duration:
+        return original
+    return (round(new_start, 3), round(new_end, 3))
+
+
+def validate_punch_ins(punch_ins, clip_start, clip_end, max_n=3,
+                       min_gap=2.0, min_lead=0.6, min_tail=0.6):
+    """Re-base the model's punch-in times to the trimmed clip and keep only
+    the ones a renderer can actually use.
+
+    The model times are ABSOLUTE source seconds; the renderer works on the
+    clip-relative timeline after trimming. Rules enforced here, silently:
+      - t inside (clip_start+min_lead, clip_end-min_tail), re-based to 0
+      - layer in {"cam","gameplay"} (anything else -> "cam")
+      - scale clamped 1.15-1.6; duration clamped 0.6-1.6
+      - sorted by t, later entries closer than min_gap to the previous kept
+        one are dropped, hard cap max_n
+    Returns a list of dicts (possibly empty); never raises.
+    """
+    out = []
+    lo, hi = clip_start + min_lead, clip_end - min_tail
+    for p in (punch_ins or [])[:8]:
+        try:
+            t = float(p.get("t", -1))
+        except (TypeError, ValueError):
+            continue
+        if not lo <= t <= hi:
+            continue
+        try:
+            scale = min(1.6, max(1.15, float(p.get("scale", 1.3))))
+            dur = min(1.6, max(0.6, float(p.get("duration", 1.0))))
+        except (TypeError, ValueError):
+            scale, dur = 1.3, 1.0
+        layer = str(p.get("layer", "cam")).strip().lower()
+        if layer not in ("cam", "gameplay"):
+            layer = "cam"
+        out.append({"t": round(t - clip_start, 3), "layer": layer,
+                    "scale": scale, "duration": round(dur, 2)})
+    out.sort(key=lambda p: p["t"])
+    kept = []
+    for p in out:
+        if kept and p["t"] - kept[-1]["t"] < min_gap:
+            continue
+        kept.append(p)
+        if len(kept) >= max_n:
+            break
+    return kept
+
+
 # --- Rate-limit helpers (TPM pacing + 429 handling) --------------------------
 # Groq's free tier allows 8,000 tokens/minute on gpt-oss-120b while a single
 # scoring batch costs ~900 (measured 15-sep-2026: a 1,821-character scoring
