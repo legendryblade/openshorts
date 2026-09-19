@@ -440,10 +440,29 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
     elif choice == "vertical" and best_v:
         keep = best_v
     else:
-        # Auto: whichever strip keeps more of the frame; none -> full frame.
+        # Auto: PREFER removing the strip that contains the facecam.
+        # The facecam is at (x,y,w,h), so it overlaps the right edge if x+w > orig_w*0.5
+        # and the bottom edge if y+h > orig_h*0.5. We want to KEEP the side opposite the facecam.
         cands = [k for k in (best_h, best_v) if k]
-        keep = (max(cands, key=lambda k: k[2] * k[3])
-                if cands else (0, 0, orig_w, orig_h))
+        if not cands:
+            keep = (0, 0, orig_w, orig_h)
+        else:
+            # Prefer the strip that DOES NOT contain the facecam center
+            cx, cy = x + w/2, y + h/2
+            cam_right = cx > orig_w * 0.5
+            cam_bottom = cy > orig_h * 0.5
+            
+            # Score each candidate: prefer the one that keeps the side opposite the facecam
+            def score_keep(k):
+                kx, ky, kw, kh = k
+                # Check if this keep-rect contains the facecam center
+                contains_cam = (kx <= cx < kx + kw) and (ky <= cy < ky + kh)
+                # Prefer keep-rects that DON'T contain the cam center
+                score = 0 if contains_cam else 1
+                # Among equal, prefer larger area
+                return (score, k[2] * k[3])
+            
+            keep = max(cands, key=score_keep)
 
     # Fallback: if the best keep loses too much of the frame, keep the FULL
     # frame and drop the PiP — a small cam in the gameplay is less wrong than
