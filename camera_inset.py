@@ -509,11 +509,11 @@ def gaming_split_filtergraph(orig_w, orig_h, out_w, out_h, facecam_rect,
             f"[bga]scale=-2:{out_h},crop=w=min(iw\,{out_w}):h={out_h},"
             f"scale={out_w}:{out_h},gblur=sigma=14[bg];"
             f"[ga]{gp_pre}crop=w={gp_base[2]}:h={gp_base[3]}:x={gp_base[0]}:y={gp_base[1]},"
-            f"scale={gp_w}:{gp_h}[gameplay];"
+            f"scale={gp_w}:{gp_h}:flags=lanczos[gameplay];"
             f"[ca]{cam_pre}crop=w={cam_base[2]}:h={cam_base[3]}:x={cam_base[0]}:y={cam_base[1]},"
-            f"scale={cam_w}:{cam_h}[facecam];"
+            f"scale={cam_w}:{cam_h}:flags=lanczos[facecam];"
             f"[bg][gameplay]overlay=x={gp_x}:y={gp_y}[withgame];"
-            f"[withgame][facecam]overlay=x={cam_x}:y={cam_y},setsar=1[v]"
+            f"[withgame][facecam]overlay=x={cam_x}:y={cam_y},unsharp=5:5:0.8:5:5:0.4,setsar=1[v]"
         )
     else:
         gp_scale = min(out_w / float(orig_w), gp_panel_h / float(orig_h))
