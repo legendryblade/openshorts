@@ -1571,7 +1571,11 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                 # OpenAI-compatible servers: model still loading, busy, or a
                 # small model that skipped a required field this time.
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-                'validation error'))
+                'validation error',
+                # Windows TCP RST: the same network flake that kills git
+                # clones and pip installs on this connection (16+-sep logs).
+                'forcibly closed', '10054', 'WinError 10054',
+                'connection was reset', 'Connection reset'))
             attempt += 1
             if attempt >= max_attempts or not transient:
                 raise
