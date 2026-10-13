@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenShorts — Video to Shorts</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0c;color:#e4e4e7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh}
+nav{padding:16px 32px;border-bottom:1px solid #27272a;display:flex;justify-content:space-between;align-items:center}
+nav strong{font-size:18px;color:#8b5cf6}
+.container{max-width:720px;margin:0 auto;padding:32px 20px}
+h1{font-size:26px;text-align:center;margin-bottom:8px}
+.sub{text-align:center;color:#71717a;font-size:14px;margin-bottom:28px}
+.card{background:#18181b;border:1px solid #27272a;border-radius:16px;padding:24px;margin-bottom:20px}
+label{display:block;font-size:13px;color:#a1a1aa;margin-bottom:8px;font-weight:600}
+input[type=text],input[type=number]{width:100%;background:#0a0a0c;border:1px solid #3f3f46;border-radius:10px;padding:12px 14px;color:#e4e4e7;font-size:15px;outline:none}
+input:focus{border-color:#8b5cf6}
+.row{display:flex;gap:12px;margin-top:16px}
+.row>div{flex:1}
+select{width:100%;background:#0a0a0c;border:1px solid #3f3f46;border-radius:10px;padding:12px;color:#e4e4e7;font-size:15px}
+.btn{width:100%;background:#8b5cf6;color:#fff;border:none;border-radius:12px;padding:14px;font-size:16px;font-weight:700;cursor:pointer;margin-top:20px;transition:background .2s}
+.btn:hover{background:#7c3aed}
+.btn:disabled{background:#3f3f46;cursor:not-allowed}
+.btn-secondary{background:#27272a;color:#e4e4e7;margin-top:10px}
+.btn-secondary:hover{background:#3f3f46}
+#status{display:none;margin-top:20px}
+#statusLog{background:#0a0a0c;border:1px solid #27272a;border-radius:10px;padding:14px;max-height:300px;overflow-y:auto;font-family:'Cascadia Code',monospace;font-size:12px;color:#a1a1aa;white-space:pre-wrap;word-wrap:break-word}
+.statusBadge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600;margin-bottom:10px}
+.status-queued{background:#3f3f46;color:#a1a1aa}
+.status-processing{background:#1e3a5f;color:#60a5fa;animation:pulse 1.5s infinite}
+.status-done{background:#14532d;color:#4ade80}
+.status-error{background:#7f1d1d;color:#f87171}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+#clips{display:none}
+.clipCard{background:#18181b;border:1px solid #27272a;border-radius:14px;padding:16px;margin-top:14px;display:flex;gap:14px;align-items:center}
+.clipCard video{width:120px;border-radius:8px;flex-shrink:0}
+.clipInfo{flex:1;min-width:0}
+.clipTitle{font-size:14px;font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.clipMeta{font-size:12px;color:#71717a}
+.clipBtn{background:#8b5cf6;color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;text-decoration:none;display:inline-block;margin-top:6px}
+.clipBtn:hover{background:#7c3aed}
+.downloadAll{margin-top:16px}
+.error{background:#7f1d1d;color:#f87171;padding:12px;border-radius:10px;margin-top:12px;font-size:14px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<nav><strong>OpenShorts</strong><span style="color:#71717a;font-size:13px">Long video → Shorts</span></nav>
+<div class="container">
+<h1>🎬 Video → Shorts</h1>
+<p class="sub">AI picks the best moments, reframes to 9:16, adds karaoke captions & zooms</p>
+
+<div class="card">
+  <label>YouTube URL</label>
+  <input type="text" id="url" placeholder="https://youtube.com/watch?v=..." />
+  <div style="text-align:center;color:#52525b;margin:12px 0;font-size:13px">— or —</div>
+  <label>Upload Video File</label>
+  <input type="file" id="file" accept="video/*" style="width:100%;color:#a1a1aa;font-size:14px" />
+
+  <div class="row">
+    <div>
+      <label>Format</label>
+      <select id="format">
+        <option value="vertical">Vertical 9:16</option>
+        <option value="horizontal">Horizontal</option>
+        <option value="square">Square</option>
+        <option value="auto">Auto</option>
+      </select>
+    </div>
+    <div>
+      <label>Max Clips</label>
+      <input type="number" id="maxClips" value="3" min="1" max="10" />
+    </div>
+  </div>
+
+  <button class="btn" id="goBtn" onclick="submit()">🚀 Generate Shorts</button>
+  <div id="errorBox" class="error hidden"></div>
+</div>
+
+<div class="card" id="configCard">
+  <label style="cursor:pointer;display:flex;justify-content:space-between;align-items:center">
+    <span>⚙️ Model & Provider Config</span>
+    <span id="cfgChevron">▸</span>
+  </label>
+  <div id="configPanel" class="hidden" style="margin-top:14px">
+    <label>LLM Base URL (clip picker)</label>
+    <input type="text" id="cfg_LLM_BASE_URL" placeholder="https://api.groq.com/openai/v1" />
+    <div class="row">
+      <div><label>Model</label><input type="text" id="cfg_LLM_MODEL" placeholder="openai/gpt-oss-120b" /></div>
+      <div><label>Score Batch (windows/call)</label><input type="number" id="cfg_LLM_SCORE_BATCH" min="1" max="8" /></div>
+    </div>
+    <label>LLM API Key</label>
+    <input type="password" id="cfg_LLM_API_KEY" placeholder="gsk_..." />
+    <div class="row">
+      <div>
+        <label>Transcription</label>
+        <select id="cfg_TRANSCRIBE_BACKEND">
+          <option value="groq">Groq (cloud)</option>
+          <option value="whisper">Local Whisper</option>
+        </select>
+      </div>
+      <div><label>ASR Model</label><input type="text" id="cfg_GROQ_ASR_MODEL" placeholder="whisper-large-v3" /></div>
+    </div>
+    <label>Gemini API Key (vision/layout)</label>
+    <input type="password" id="cfg_GEMINI_API_KEY" placeholder="AIza..." />
+    <div class="row">
+      <div>
+        <label>Auto Layout</label>
+        <select id="cfg_AUTO_LAYOUT"><option value="1">On</option><option value="0">Off</option></select>
+      </div>
+      <div>
+        <label>Critique Gate</label>
+        <select id="cfg_CRITIQUE_GATE"><option value="1">On</option><option value="0">Off</option></select>
+      </div>
+    </div>
+    <button class="btn btn-secondary" onclick="saveConfig()">💾 Save Config (writes .env)</button>
+    <div id="cfgStatus" style="font-size:13px;color:#4ade80;margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="card" id="status">
+  <span class="statusBadge status-queued" id="statusBadge">queued</span>
+  <div id="statusLog"></div>
+</div>
+
+<div id="clips">
+  <h2 style="font-size:18px;margin-bottom:4px">✅ Your Clips</h2>
+  <div id="clipList"></div>
+  <button class="btn btn-secondary downloadAll" onclick="downloadAll()">📦 Download All Clips (ZIP)</button>
+</div>
+</div>
+
+<script>
+let jobId = null;
+let pollTimer = null;
+
+async function submit() {
+  const url = document.getElementById('url').value.trim();
+  const file = document.getElementById('file').files[0];
+  const format = document.getElementById('format').value;
+  const maxClips = document.getElementById('maxClips').value || 3;
+  const errBox = document.getElementById('errorBox');
+
+  if (!url && !file) { showError('Paste a YouTube URL or choose a video file'); return; }
+  errBox.classList.add('hidden');
+  document.getElementById('goBtn').disabled = true;
+  document.getElementById('goBtn').textContent = 'Submitting…';
+
+  try {
+    const fd = new FormData();
+    fd.append('output_format', format);
+    fd.append('target_clips', maxClips);
+    fd.append('acknowledged', 'true');
+    fd.append('captions', 'true');
+    if (url) fd.append('url', url);
+    if (file) fd.append('file', file);
+
+    const res = await fetch('/api/process', { method: 'POST', body: fd });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({detail: res.statusText}));
+      throw new Error(j.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    jobId = data.job_id;
+    document.getElementById('status').style.display = 'block';
+    setBadge('queued');
+    poll();
+  } catch (e) {
+    showError(e.message);
+    resetBtn();
+  }
+}
+
+function poll() {
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/status/${jobId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setBadge(data.status);
+      document.getElementById('statusLog').textContent = (data.logs || []).join('\n');
+      document.getElementById('statusLog').scrollTop = document.getElementById('statusLog').scrollHeight;
+
+      if (data.status === 'done') {
+        clearInterval(pollTimer);
+        showClips(data.result);
+        resetBtn();
+      } else if (data.status === 'error') {
+        clearInterval(pollTimer);
+        const lastErr = (data.logs || []).filter(l => l.includes('❌')).pop() || 'Processing failed';
+        showError(lastErr);
+        resetBtn();
+      }
+    } catch (e) { /* keep polling */ }
+  }, 3000);
+}
+
+function showClips(result) {
+  const container = document.getElementById('clipList');
+  container.innerHTML = '';
+  const clips = (result && result.clips) || [];
+  if (!clips.length) {
+    container.innerHTML = '<p style="color:#71717a;padding:20px 0">No clips in result — check logs above.</p>';
+  }
+  clips.forEach((c, i) => {
+    const url = c.url || `/videos/${jobId}/${c.file || ''}`;
+    const card = document.createElement('div');
+    card.className = 'clipCard';
+    card.innerHTML = `
+      <video src="${url}" preload="metadata" controls muted></video>
+      <div class="clipInfo">
+        <div class="clipTitle">${c.title || c.hook || `Clip ${i+1}`}</div>
+        <div class="clipMeta">Score: ${c.score ?? '—'} · ${c.duration || ''} ${c.start ? '· from '+fmtTime(c.start) : ''}</div>
+        <a class="clipBtn" href="${url}" download>⬇ Download</a>
+      </div>`;
+    container.appendChild(card);
+  });
+  document.getElementById('clips').style.display = 'block';
+}
+
+function downloadAll() {
+  window.open(`/api/jobs/${jobId}/download-all`, '_blank');
+}
+
+function setBadge(s) {
+  const b = document.getElementById('statusBadge');
+  b.textContent = s;
+  b.className = `statusBadge status-${s}`;
+}
+
+function fmtTime(s) {
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function showError(msg) {
+  const box = document.getElementById('errorBox');
+  box.textContent = msg;
+  box.classList.remove('hidden');
+}
+
+function resetBtn() {
+  document.getElementById('goBtn').disabled = false;
+  document.getElementById('goBtn').textContent = '🚀 Generate Shorts';
+}
+
+// --- Config panel ---
+document.querySelector('#configCard label').onclick = () => {
+  const p = document.getElementById('configPanel');
+  p.classList.toggle('hidden');
+  document.getElementById('cfgChevron').textContent = p.classList.contains('hidden') ? '▸' : '▾';
+  if (!p.classList.contains('hidden')) loadConfig();
+};
+
+const CFG_KEYS = ['LLM_BASE_URL','LLM_MODEL','LLM_API_KEY','LLM_SCORE_BATCH','TRANSCRIBE_BACKEND','GROQ_ASR_MODEL','GEMINI_API_KEY','AUTO_LAYOUT','CRITIQUE_GATE'];
+
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/provider-config');
+    const cfg = await res.json();
+    CFG_KEYS.forEach(k => {
+      const el = document.getElementById('cfg_' + k);
+      if (el && cfg[k] !== undefined) el.value = cfg[k];
+    });
+  } catch (e) { /* silent */ }
+}
+
+async function saveConfig() {
+  const updates = {};
+  CFG_KEYS.forEach(k => {
+    const el = document.getElementById('cfg_' + k);
+    if (el && el.value !== '') updates[k] = el.value;
+  });
+  const status = document.getElementById('cfgStatus');
+  try {
+    const res = await fetch('/api/provider-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({updates})
+    });
+    const j = await res.json();
+    status.textContent = `✅ Saved: ${j.applied.join(', ')}`;
+    status.style.color = '#4ade80';
+    setTimeout(() => { status.textContent = ''; }, 5000);
+  } catch (e) {
+    status.textContent = `❌ Save failed: ${e.message}`;
+    status.style.color = '#f87171';
+  }
+}
+</script>
+</body>
+</html>

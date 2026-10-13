@@ -50,36 +50,53 @@ class CritiqueResponse:
 
 
 CRITIQUE_PROMPT = """These {n} frames are sampled evenly across ONE finished
-vertical short (1080x1920) cut from a gaming video. Judge it as a quality
+vertical short (1080x1920) cut from a long-form video. Judge it as a quality
 gate before publishing. It is FAIL only for the objective defects below —
 anything else (framing taste, pacing, which moment was chosen) is PASS.
 
-CHECKLIST — fail the clip if ANY of these is visible in the frames:
-1. facecam_count != 1: the streamer's webcam feed must appear EXACTLY ONCE
-   (usually a small panel near the bottom). Count it: two copies of the same
-   face = FAIL, zero = FAIL.
-2. Gameplay unreadable: the game frame is so small, so stretched/squashed
-   (people or cars visibly distorted), or so buried under blur that a viewer
-   cannot tell what is happening.
-3. Captions block the view: burned-in text sits ON the speaker's face inside
-   the facecam panel, or covers the gameplay's central action.
+LAYOUT CONTEXT: {layout_context}
+The checks below that reference a facecam or gameplay apply ONLY when the
+layout context says those elements exist. If the video has no facecam or no
+gameplay (talking heads, interviews, b-roll, podcasts), skip those checks
+entirely — a clip with no facecam panel is CORRECT for those layouts, not a
+defect.
+
+UNIVERSAL CHECKS — fail the clip if ANY of these is visible in the frames:
+1. Speaker invisible: if someone is speaking (or the video's point depends on
+   a person), that person must be visible in most frames — not cropped out,
+   not a blurred silhouette, not off-frame.
+2. Content unreadable: the main content (gameplay, screen, speaker, action)
+   is so small, stretched/squashed (faces visibly distorted), or buried under
+   blur that a viewer cannot tell what is happening.
+3. Captions block the view: burned-in text sits ON the speaker's face, or
+   covers the central action the viewer needs to see.
 4. Dead frame: a majority of the sampled frames are almost entirely black,
-   or almost entirely blurred background with no gameplay visible.
+   or almost entirely blurred filler with nothing real visible.
+
+GAMING-SPLIT CHECKS (only when layout context says gaming_split):
+5. facecam_count != 1: the webcam feed must appear EXACTLY ONCE (a small
+   panel, usually at the top). Two copies = FAIL, zero when the layout
+   promises one = FAIL.
+6. Gameplay unreadable: the game frame is too small, distorted, or buried.
 
 Answer for EACH defect honestly against the frames. Do not invent problems:
-a clip with one facecam panel, readable gameplay and non-blocking captions is
-a PASS even if imperfect.
+a clip whose content is visible, its speaker on screen (if applicable), and
+captions non-blocking is a PASS even if imperfect.
 
 Return JSON exactly:
 {{"verdict": "pass"|"fail",
-  "facecam_count": <integer, how many webcam-feed copies you see>,
+  "facecam_count": <integer, how many webcam-feed copies you see (0 if none expected)>,
   "issues": ["<defect>: <which frames>", ...],
   "notes": "<max 20 words>"}}
 """
 
 
-def critique_clip(clip_path, samples=None):
+def critique_clip(clip_path, samples=None, layout="auto"):
     """Gemini's verdict on a finished short, or None on any failure.
+
+    layout: the strategy the clip was rendered with ("GAMING_SPLIT",
+    "SCREENCAST", "TRACK", "GENERAL", "SPLIT", etc). Adjusts which checks
+    the prompt applies — facecam checks only fire for GAMING_SPLIT.
 
     None means "gate unavailable" — callers must treat that as PASS so a
     quota outage or SDK error can never block or lose a rendered clip.
@@ -89,6 +106,23 @@ def critique_clip(clip_path, samples=None):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
+
+    layout_context = {
+        "GAMING_SPLIT": "gaming video with a persistent facecam panel "
+                        "(webcam feed should appear exactly once) and a "
+                        "gameplay panel",
+        "SCREENCAST": "screen recording — the screen content is the point, "
+                      "no facecam expected",
+        "SPLIT": "two speakers stacked vertically",
+        "ALTERNATE": "speaker cuts between two people",
+        "TRACK": "single speaker, centre-cropped from landscape",
+        "GENERAL": "general footage — blurred background with content "
+                   "centred",
+        "WIDE": "full-width content (screen/slide) with blurred filler",
+        "INSET": "screen on top, webcam below",
+    }.get(str(layout or "auto").strip().upper(),
+          "auto — judge by what you see; apply facecam/gameplay checks only "
+          "if those elements are present")
 
     try:
         from layout_picker import sample_frames
@@ -105,7 +139,8 @@ def critique_clip(clip_path, samples=None):
                  for b in frames]
         response = client.models.generate_content(
             model=MODEL,
-            contents=parts + [CRITIQUE_PROMPT.format(n=len(frames))],
+            contents=parts + [CRITIQUE_PROMPT.format(
+                n=len(frames), layout_context=layout_context)],
             config=genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema={
@@ -131,15 +166,17 @@ def critique_clip(clip_path, samples=None):
         return None
 
 
-def gate(clip_path, redo_fn=None, samples=None):
+def gate(clip_path, redo_fn=None, samples=None, layout="auto"):
     """Critique a finished clip; re-render once through redo_fn on fail.
 
+    layout: the strategy the clip was rendered with — adjusts which checks
+    apply (facecam checks only for GAMING_SPLIT).
     redo_fn() must rebuild the clip at the same path (a simpler layout) and
     may be None, in which case a fail is only reported. The second verdict is
     final either way — the gate can never loop. Returns the CritiqueResponse
     that decided the outcome (or None when the gate is disabled/unavailable).
     """
-    verdict = critique_clip(clip_path, samples=samples)
+    verdict = critique_clip(clip_path, samples=samples, layout=layout)
     if verdict is None or verdict.passed:
         if verdict is not None:
             print(f"   🧐 Critique: PASS ({verdict.notes or 'no defects'})")

@@ -1910,6 +1910,17 @@ async def run_job(job_id, job_data):
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
 
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Serve the web UI."""
+    ui_path = os.path.join(os.path.dirname(__file__), "static_ui", "index.html")
+    if os.path.exists(ui_path):
+        with open(ui_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/gallery")
+
+
 @app.get("/health")
 async def health():
     """Lightweight liveness probe for uptime monitoring."""
@@ -1940,6 +1951,88 @@ async def get_config():
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
     }
+
+
+# --- Provider/model configuration (self-host) --------------------------------
+
+_PROVIDER_ENV_KEYS = [
+    "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "LLM_SCORE_BATCH",
+    "TRANSCRIBE_BACKEND", "GROQ_API_KEY", "GROQ_ASR_MODEL",
+    "GEMINI_API_KEY", "AUTO_LAYOUT", "CAPTION_MARGIN_V", "CRITIQUE_GATE",
+]
+_SECRET_KEYS = {"LLM_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"}
+
+
+def _read_env_file() -> dict:
+    """Parse the project .env into a dict (last value wins)."""
+    env = {}
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip()
+    return env
+
+
+@app.get("/api/provider-config")
+async def get_provider_config():
+    """Current AI provider settings. Secrets are masked."""
+    env = _read_env_file()
+    out = {}
+    for key in _PROVIDER_ENV_KEYS:
+        val = env.get(key, os.environ.get(key, ""))
+        out[key] = ("•••" + val[-4:]) if (key in _SECRET_KEYS and val) else val
+    out["_secrets"] = sorted(_SECRET_KEYS)
+    return out
+
+
+class ProviderConfigUpdate(BaseModel):
+    updates: Dict[str, str]
+
+
+@app.post("/api/provider-config")
+async def update_provider_config(body: ProviderConfigUpdate):
+    """Update provider settings in .env and apply to the running process.
+
+    Secrets set to "•••" (masked placeholder) are skipped, so a UI round-trip
+    doesn't clobber keys the client never saw.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    env = _read_env_file()
+    applied = []
+    for key, val in body.updates.items():
+        if key not in _PROVIDER_ENV_KEYS:
+            continue
+        if key in _SECRET_KEYS and (not val or val.startswith("•••")):
+            continue
+        env[key] = val
+        os.environ[key] = val
+        applied.append(key)
+
+    lines = []
+    seen = set()
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                key = stripped.partition("=")[0].strip() if "=" in stripped else None
+                if key in env and key not in seen:
+                    lines.append(f"{key}={env[key]}")
+                    seen.add(key)
+                elif not key or key in seen:
+                    continue
+                else:
+                    lines.append(line.rstrip("\n"))
+    for key, val in env.items():
+        if key not in seen:
+            lines.append(f"{key}={val}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return {"applied": applied}
 
 async def _probe_youtube_quality(url: str) -> dict:
     """Run quality_probe.py in a worker thread; {} on any failure (fail-open)."""

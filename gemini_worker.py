@@ -366,6 +366,14 @@ DETAIL_PROMPT_TEMPLATE = """
 You are a senior short-form video editor and viral copywriter.
 Choose the BEST short clips from these shortlisted candidate windows.
 
+CONTENT-TYPE AWARENESS — read the transcript FIRST to understand what kind of
+video this is, then apply the right editorial lens:
+- Gaming: hooks = kills, fails, clutch moments, funny reactions, near-misses
+- Podcast/Talk: hooks = hot takes, stories with tension, disagreements, confessions
+- Tutorial/Educational: hooks = "the mistake", the payoff, the "why nobody tells you"
+- Vlog/Story: hooks = the setup promise, the twist, the emotional peak
+- News/Commentary: hooks = controversy, the surprise fact, the "what this means"
+
 CLIP RULES:
 - Return only valid JSON.
 - Each clip must be {min_secs:g} to {max_secs:g} seconds long, in absolute seconds from the start of the source video.
@@ -420,6 +428,8 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
     timestamp where the reaction peaks.
   - layer "gameplay": a visual ACTION beat (explosion, kill, near-miss, car
     crash) — the gameplay view zooms in briefly. Anchor t to when it happens.
+  - For NON-GAMING content (podcast, vlog, talking head), omit punch_ins
+    entirely — zoom on a talking head is a defect, not an effect.
   - Omit punch_ins (or return []) when nothing qualifies — a clip with zero
     punch-ins is correct. Never two within 2s of each other, never outside
     the clip's own start/end, never more than 3.

@@ -2040,7 +2040,7 @@ if __name__ == '__main__':
 
     if not os.path.exists(input_video):
         print(f"❌ Input file not found: {input_video}")
-        exit(1)
+        sys.exit(1)
 
     # Layout choice is per SOURCE video, not per clip: one upload and one call
     # instead of one per clip, and the answer is a property of the material
@@ -2247,7 +2247,10 @@ if __name__ == '__main__':
                                     # Mirror deliver_path: the captioned file
                                     # replaces the canonical one on success.
                                     os.replace(cap2, clip_final_path)
-                            critique_gate.gate(final_deliver, redo_fn=_redo_simple)
+                            _last_layout = (clip['layout_ranges'][0][2]
+                                            if clip.get('layout_ranges') else "auto")
+                            critique_gate.gate(final_deliver, redo_fn=_redo_simple,
+                                               layout=_last_layout)
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
                         # Hand the API the file to actually serve for this clip.
                         # Without it the status poller guesses the clean reframe
