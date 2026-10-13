@@ -1807,8 +1807,16 @@ def get_viral_clips(transcript_result, video_duration):
                 min_secs=min_secs, max_secs=max_secs,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
-        shorts = _run_stage_split(client, model_name, shortlist, _detail_prompt,
-                                  gemini_worker.DetailResponse, "shorts", costs, "detail")
+        # Batch the detail pass too: 10 verbose gaming windows + the prompt
+        # template can exceed an 8K TPM budget in a single call (the 413 that
+        # killed the Karen run). Same batch size as scoring keeps each call
+        # inside the per-minute window.
+        detail_batches = [shortlist[b:b + SCORE_BATCH]
+                          for b in range(0, len(shortlist), SCORE_BATCH)]
+        shorts = []
+        for db in detail_batches:
+            shorts.extend(_run_stage_split(client, model_name, db, _detail_prompt,
+                                           gemini_worker.DetailResponse, "shorts", costs, "detail"))
         if len(shorts) > max_clips:
             # By score, never by position: the results arrive in transcript
             # order, so slicing kept the earliest clips and silently dropped
