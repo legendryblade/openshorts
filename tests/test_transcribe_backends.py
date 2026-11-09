@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import types
 from types import SimpleNamespace
@@ -234,10 +235,121 @@ def test_groq_without_segments_synthesizes_one_from_words():
 
 
 def test_groq_part_plan():
-    # 100 MB of FLAC over an hour, 24 MB cap -> 864 s parts.
-    assert tb._groq_part_plan(100e6, 3600.0, 24e6) == 864
+    # 100 MB of FLAC over an hour, 24 MB cap -> ~778 s parts (90% of the cap;
+    # no floor: dense audio must not be forced into oversized parts).
+    part = tb._groq_part_plan(100e6, 3600.0, 24e6)
+    assert 700 <= part <= 800, part
+    assert part * (100e6 / 3600.0) < 24e6, "planned part must fit the cap"
     assert tb._groq_part_plan(10e6, 600.0, 24e6) is None  # single upload
     assert tb._groq_part_plan(10e6, 0.0, 24e6) is None  # unknown duration
+
+
+def test_groq_part_plan_no_floor_for_dense_audio():
+    # Dense game/music audio (~12 MB/min): a 300s floor would send 58 MB parts
+    # and Groq answers 413 — that killed cloud ASR on 17-oct-2026.
+    part = tb._groq_part_plan(291e6, 1500.0, 24e6)
+    assert part is not None and part < 300
+    assert part * (291e6 / 1500.0) < 24e6
+
+
+def test_groq_part_plan_splits_when_duration_unreadable():
+    # Returning None here handed the whole over-cap file to the API for a 413:
+    # a duration ffprobe cannot read is a reason to slice conservatively, not
+    # to stop slicing.
+    assert tb._groq_part_plan(100e6, 0.0, 24e6) == tb._UNKNOWN_DURATION_PART_SECS
+
+
+# --- chunk offsets (the 2-nov-2026 "captions don't match" bug) ---------------
+
+def _ffmpeg_available():
+    import shutil
+    return shutil.which("ffmpeg") and shutil.which("ffprobe")
+
+
+pytestmark_ffmpeg = pytest.mark.skipif(
+    not _ffmpeg_available(), reason="needs ffmpeg/ffprobe on PATH")
+
+
+@pytestmark_ffmpeg
+def test_segment_muxer_parts_report_a_duration(tmp_path):
+    """The regression the old offsets died of: muxer FLAC parts probe N/A.
+
+    ``format=duration`` and ``stream=duration`` both answer N/A for these
+    files, so _probe_duration has to fall back to the packet table — otherwise
+    every chunk measures 0 s and every offset collapses onto the start.
+    """
+    src = _tone_flac(tmp_path, seconds=20)
+    outdir = tmp_path / "seg"
+    outdir.mkdir()
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+                    "-f", "segment", "-segment_time", "5", "-c:a", "flac",
+                    str(outdir / "part_%05d.flac")], check=True, timeout=120)
+    parts = sorted(outdir.glob("part_*.flac"))
+    assert len(parts) >= 3
+    # Header really is unreadable (that is what makes this a regression test).
+    header = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                             "format=duration", "-of", "csv=p=0", str(parts[1])],
+                            capture_output=True, text=True, timeout=60).stdout.strip()
+    assert header in ("N/A", ""), f"expected an unreadable header, got {header!r}"
+    assert tb._probe_duration(parts[1]) == pytest.approx(5.0, abs=0.3)
+    # And the muxer stamps them against the source, so part 2 starts at 5 s.
+    assert tb._probe_pts_range(parts[1])[0] == pytest.approx(5.0, abs=0.3)
+
+
+@pytestmark_ffmpeg
+def test_groq_split_offsets_tile_the_timeline(tmp_path):
+    """Parts must land at absolute, strictly increasing, gap-free offsets.
+
+    End-to-end form of the bug: 23 parts of a 4-hour video all got offset 0.0,
+    so the whole video was transcribed as its first 9 minutes.
+    """
+    src = _tone_flac(tmp_path, seconds=60)
+    import os
+    full = tb._extract_groq_audio(str(src), str(tmp_path))
+    parts = tb._split_audio_for_groq(str(src), str(tmp_path),
+                                     max_bytes=os.path.getsize(full) / 4)
+    assert len(parts) >= 3, [p for p, _ in parts]
+    offsets = [off for _, off in parts]
+    assert offsets[0] == pytest.approx(0.0, abs=0.2)
+    assert all(b > a for a, b in zip(offsets, offsets[1:])), offsets
+    # Every gap is a real part, so consecutive offsets advance by more than a
+    # rounding error and the last part still sits inside the source.
+    assert all(b - a > 1.0 for a, b in zip(offsets, offsets[1:])), offsets
+    assert offsets[-1] < 60.0
+    # Coverage: parts concatenated by offset span the whole audio. Measured from
+    # the packet table — a muxer part's header carries the WHOLE file's sample
+    # count, not its own slice.
+    covered = offsets[-1] + tb._probe_pts_range(parts[-1][0])[1]
+    assert covered == pytest.approx(60.0, abs=1.0)
+
+
+@pytestmark_ffmpeg
+def test_groq_split_resplit_keeps_both_parts(tmp_path):
+    """Two oversized parts must not share sub-file names (the collision bug).
+
+    A shared ``sub_%05d`` prefix made each ffmpeg run overwrite the previous
+    part's sub files, so both parts collected the same last-written files and
+    their offsets drifted.
+    """
+    src = _tone_flac(tmp_path, seconds=60)
+    import os
+    full = tb._extract_groq_audio(str(src), str(tmp_path))
+    parts = tb._split_audio_for_groq(str(src), str(tmp_path),
+                                     max_bytes=os.path.getsize(full) / 8)
+    names = [os.path.basename(p) for p, _ in parts]
+    assert len(names) == len(set(names)), names
+    offsets = [off for _, off in parts]
+    assert all(b > a for a, b in zip(offsets, offsets[1:])), offsets
+
+
+def _tone_flac(tmp_path, seconds):
+    """Small deterministic test audio, so chunk sizes are predictable."""
+    path = tmp_path / "source.flac"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", f"sine=frequency=440:sample_rate=16000:duration={seconds}",
+                    "-ac", "1", "-c:a", "flac", str(path)],
+                   check=True, timeout=120)
+    return path
 
 
 def test_groq_requires_api_key(monkeypatch):

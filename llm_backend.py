@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Optional, Tuple, Type
 
 import httpx
@@ -93,6 +94,77 @@ def _headers() -> dict:
     # --api-key) wants the header present; "ollama" is the documented placeholder.
     key = (os.environ.get("LLM_API_KEY") or "ollama").strip()
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+
+def _auth(key: str) -> dict:
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+
+# One pool wait at a time is bounded: Groq's token window is 60s, so 95s
+# covers a full refill with margin. Anything longer is the caller's pacer's
+# job, not this function's.
+MAX_POOL_WAIT = 95.0
+
+
+def _send(client, url, body):
+    """POST one completion with the smart rate-limit policy: ROTATE, then WAIT.
+
+    1. Every key is tried once — a 429 cools that key for the server's own
+       reset window and the next attempt goes straight to the next key, no
+       sleep between rotations.
+    2. If every key is benched (a burst larger than N× the per-minute
+       budget), sleep until the SOONEST key's window refills and retry —
+       that is the "wait for TPM to come back" step, using the server's own
+       reset header rather than a guessed backoff.
+    3. After bounded cycles, raise ``RateLimitError`` carrying the last 429's
+       headers so the caller's pacer takes over from real numbers.
+
+    With no pool (local Ollama) this is a plain POST; a single key gets one
+    rotation cycle plus one wait. Returns (response, key_used).
+    """
+    import groq_pool
+
+    # A GROQ_API_KEYS pool belongs to Groq's endpoints only: an OpenRouter or
+    # Ollama picker must keep using LLM_API_KEY (or the ollama placeholder),
+    # never a rotating Groq key against someone else's server.
+    pool = groq_pool.get_pool()
+    if "groq.com" not in base_url() and not os.environ.get("LLM_API_KEYS"):
+        pool = groq_pool.KeyPool([])
+    if len(pool) == 0:
+        return client.post(url, json=body, headers=_headers()), None
+
+    last = None
+    cycles = 3
+    while cycles:
+        cycles -= 1
+        tried = set()
+        while True:
+            key = pool.pick()
+            if key is None or key in tried:
+                break  # every key answered 429 this cycle
+            tried.add(key)
+            resp = client.post(url, json=body, headers=_auth(key))
+            if resp.status_code != 429:
+                return resp, key
+            info = parse_rate_limit_headers(resp.headers)
+            pool.penalize(key, info.get("retry_after") or info.get("reset_tokens_seconds"))
+            last = resp
+        # All keys benched: wait for the soonest window to refill, then retry.
+        wait = pool.soonest_recovery()
+        if wait is None:
+            continue  # a key already recovered — retry immediately
+        if wait > MAX_POOL_WAIT:
+            break     # beyond one full window: hand back to the pacer
+        time.sleep(wait + 0.5)
+
+    if last is None:  # defensive: no key ever produced a response
+        return client.post(url, json=body, headers=_headers()), None
+    info = parse_rate_limit_headers(last.headers)
+    raise RateLimitError(
+        f"LLM server 429 from {url} after rotating every key and waiting for "
+        f"the token window: {last.text[:200]}",
+        rate_limit=info,
+        retry_after=info.get("retry_after") or info.get("reset_tokens_seconds"))
 
 
 def _client(**kwargs) -> httpx.Client:
@@ -202,7 +274,7 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
                 body["max_completion_tokens"] = max_completion_tokens()
             if fmt is not None:
                 body["response_format"] = fmt
-            resp = client.post(url, json=body, headers=_headers())
+            resp = _send(client, url, body)[0]
             if fmt is not None and _is_format_rejection(resp):
                 # The server does not know this response_format flavour; the
                 # next loop iteration asks for a looser one.

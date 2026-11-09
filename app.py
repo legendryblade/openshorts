@@ -1,5 +1,7 @@
 import os
 import llm_backend
+import content_profile
+import groq_pool
 import re
 import sys
 import uuid
@@ -36,7 +38,11 @@ load_dotenv()
 
 # Constants
 UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "output"
+# OUTPUT_DIR was hardcoded here while .env advertised
+# OUTPUT_DIR=E:\openshorts_output, so every job wrote to the repo drive
+# regardless of the setting. With D: at 100%, /api/jobs/{id}/download-all — which
+# builds the ZIP inside the job dir — died with HTTP 500 on a 343 MB bundle.
+OUTPUT_DIR = (os.environ.get("OUTPUT_DIR") or "output").strip() or "output"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -1801,18 +1807,38 @@ async def run_job(job_id, job_data):
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
+        # DETACHED_PROCESS + new process group: the worker no longer dies when
+        # the web server dies (uvicorn restarts took 20-minute renders with
+        # them). Logs go to a file the status poller tails, and the heartbeat
+        # manifest keeps a NEW server from resuming this job.
+        _job_log = os.path.join(output_dir, "worker.log")
+        _DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        _logfh = None
+        _log_offset = 0
+        try:
+            _logfh = open(_job_log, "w", encoding="utf-8", errors="replace")
+        except OSError:
+            _logfh = None
         process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, # Merge stderr to stdout
+            stdout=_logfh if _logfh else subprocess.PIPE,
+            stderr=subprocess.STDOUT if _logfh else subprocess.PIPE,
             env=env,
-            cwd=os.getcwd()
+            cwd=os.getcwd(),
+            creationflags=_DETACHED if os.name == "nt" else 0,
+            close_fds=True
         )
         
-        # We need to capture logs in a thread because Popen isn't async
-        t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
-        t_log.daemon = True
-        t_log.start()
+        # We need to capture logs in a thread because Popen isn't async — but
+        # only when the worker's output really is a pipe. Under the detached
+        # path below stdout is the log file, so ``process.stdout`` is None and
+        # the reader thread used to die on ``None.readline`` (then again in its
+        # ``finally``, which closes a stream that never existed).
+        if process.stdout is not None:
+            t_log = threading.Thread(target=enqueue_output,
+                                     args=(process.stdout, job_id))
+            t_log.daemon = True
+            t_log.start()
         
         # Async wait for process with incremental updates
         start_wait = time.time()
@@ -1822,6 +1848,52 @@ async def run_job(job_id, job_data):
             if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
                 _touch_manifest(job_id)
                 last_heartbeat = time.time()
+
+            # Detached workers log to a file, not a pipe: tail it into the
+            # job log exactly like the reader thread used to do.
+            if _logfh is not None:
+                try:
+                    _logfh.flush()
+                    with open(_job_log, "r", encoding="utf-8", errors="replace") as _lf:
+                        _lf.seek(_log_offset)
+                        _new = _lf.read()
+                        _log_offset = _lf.tell()
+                    for _line in _new.splitlines():
+                        _line = _scrub_secrets(_line.strip())
+                        if not _line:
+                            continue
+                        if _line.startswith("CLIP_READY "):
+                            try:
+                                _, _idx, _fn = _line.split(" ", 2)
+                                jobs[job_id].setdefault('ready_files', {})[int(_idx)] = _fn
+                            except ValueError:
+                                pass
+                            continue
+                        if _line.startswith("PROXY_BYTES="):
+                            try:
+                                if job_id in jobs:
+                                    jobs[job_id]['proxy_bytes'] = int(
+                                        _line.split("=", 1)[1])
+                            except ValueError:
+                                pass
+                            continue
+                        if _line.startswith("PROXY_ROUTE="):
+                            # Which download attempt won, and why the free ones
+                            # failed. The pipe reader recorded this; the tail
+                            # path is the normal one now, so it has to as well
+                            # or the ledger quietly stops being written.
+                            try:
+                                from cloud import proxy_ledger as _pl
+                                _route = _pl.parse_route_line(_line)
+                                if _route is not None and job_id in jobs:
+                                    jobs[job_id]['proxy_route'] = _route
+                            except Exception:
+                                pass
+                            continue
+                        if job_id in jobs:
+                            jobs[job_id]['logs'].append(_line)
+                except (OSError, ValueError):
+                    pass
             
             # Check for partial results every 2 seconds
             # Look for metadata file
@@ -1909,6 +1981,13 @@ async def run_job(job_id, job_data):
         # Exception text can embed URLs with credentials (e.g. the proxy URL
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
+    finally:
+        if _logfh is not None:
+            try:
+                _logfh.flush()
+                _logfh.close()
+            except OSError:
+                pass
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -1950,6 +2029,9 @@ async def get_config():
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        # Rotating key pool (GROQ_API_KEYS): masked, with per-key cooldown
+        # state so the UI can show which keys a rate limit benched.
+        "keyPool": [] if BILLING_ENABLED else groq_pool.pool_status(),
     }
 
 
@@ -1957,10 +2039,11 @@ async def get_config():
 
 _PROVIDER_ENV_KEYS = [
     "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "LLM_SCORE_BATCH",
-    "TRANSCRIBE_BACKEND", "GROQ_API_KEY", "GROQ_ASR_MODEL",
+    "TRANSCRIBE_BACKEND", "GROQ_API_KEY", "GROQ_API_KEYS", "GROQ_ASR_MODEL",
     "GEMINI_API_KEY", "AUTO_LAYOUT", "CAPTION_MARGIN_V", "CRITIQUE_GATE",
+    "CAPTION_TEMPLATE",
 ]
-_SECRET_KEYS = {"LLM_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"}
+_SECRET_KEYS = {"LLM_API_KEY", "GROQ_API_KEY", "GROQ_API_KEYS", "GEMINI_API_KEY"}
 
 
 def _read_env_file() -> dict:
@@ -2264,6 +2347,8 @@ async def process_endpoint(
     clip_max_seconds: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
+    content_style: Optional[str] = Form(None),
+    content_genre: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
@@ -2298,6 +2383,8 @@ async def process_endpoint(
         clip_max_seconds = body.get("clip_max_seconds")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
+        content_style = body.get("content_style")
+        content_genre = body.get("content_genre")
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
         upload_id = body.get("upload_id")
@@ -2472,6 +2559,26 @@ async def process_endpoint(
     if captions is not None and str(captions).lower() in ("0", "false", "no"):
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
+
+    # Editorial lens. WHAT KIND of video this is gets detected from the
+    # transcript by the worker; WHAT THE USER WANTS is this request-level choice.
+    # A bad value is a 400 rather than a silent downgrade: asking for funny
+    # moments and quietly getting generic ones is the worst possible outcome.
+    raw_style = raw_genre = ""
+    try:
+        pinned_style = content_profile.parse_style_param(content_style)
+        pinned_genre = content_profile.parse_genre_param(content_genre)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if pinned_style:
+        env["CONTENT_STYLE"] = pinned_style
+        raw_style = pinned_style
+    if pinned_genre:
+        env["CONTENT_GENRE"] = pinned_genre
+        raw_genre = pinned_genre
+    if raw_style or raw_genre:
+        print(f"[editorial] job={job_id} style={raw_style or 'general'} "
+              f"genre={raw_genre or 'auto-detect'}")
 
     input_path = None
     if url:
@@ -2822,6 +2929,118 @@ async def download_all_clips(job_id: str, request: Request):
     )
 
 
+# --- Caption templates (self-host) ------------------------------------------
+
+@app.get("/api/caption-templates")
+async def list_caption_templates():
+    """The caption template registry plus which one is active, for the
+    Settings UI's picker and previews. Only safe-to-display fields: the
+    client re-renders the preview from these, never raw ASS."""
+    import subtitles
+    active = (os.environ.get("CAPTION_TEMPLATE") or "default").strip().lower()
+    if active not in subtitles.CAPTION_TEMPLATES:
+        active = "default"
+    templates = []
+    for name, style in subtitles.CAPTION_TEMPLATES.items():
+        templates.append({
+            "name": name,
+            "font_size": style.get("font_size"),
+            "font_color": style.get("font_color"),
+            "highlight_color": style.get("highlight_color"),
+            "border_color": style.get("border_color"),
+            "border_width": style.get("border_width"),
+            "effect": style.get("effect"),
+            "base_opacity": style.get("base_opacity"),
+            "uppercase": style.get("uppercase"),
+            # The editor groups words into caption lines the same way the
+            # renderer does, which needs the line's own budget — not a guess.
+            "max_chars": style.get("max_chars"),
+            "max_duration": style.get("max_duration"),
+        })
+    return {"templates": templates, "active": active}
+
+
+# --- Job history (self-host) ------------------------------------------------
+
+def _rejudge_stale_verdict(clip, transcript):
+    """Re-measure a caption verdict that predates the current pacing rules.
+
+    A stored verdict without its ``clip`` range was written before the audit
+    learned to judge a karaoke reveal by speaking speed instead of reading
+    speed, and before any edit re-measured it — so the library can still flag a
+    clip the current rules clear. The metadata stays as the historical record;
+    the read model tells the truth about the video as it ships today.
+    """
+    review = clip.get("caption_review")
+    if not isinstance(review, dict) or review.get("clip") is not None:
+        return review                      # nothing recorded, or already current
+    if not transcript or not transcript.get("segments"):
+        return review
+    try:
+        import caption_audit
+        _tpl = get_caption_style()
+        verdict = caption_audit.audit(
+            transcript, float(clip.get("start") or 0.0),
+            float(clip.get("end") or 0.0),
+            max_chars=_tpl["max_chars"], max_duration=_tpl["max_duration"],
+            karaoke=(_tpl.get("style") == "karaoke"))
+        return caption_audit.verdict_payload(verdict)
+    except Exception:
+        return review                      # a bad audit never hides a clip
+
+
+@app.get("/api/jobs")
+async def list_jobs(limit: int = 60):
+    """Finished jobs rebuilt from disk, so history survives a restart.
+
+    The in-memory ``jobs`` dict is the live queue and dies with the process;
+    this scans OUTPUT_DIR/{job_id}/*_metadata.json instead, resolving each
+    clip to its canonical (newest derived) file the same way the download
+    bundle does. Self-host only: cloud-mode projects live in R2 behind
+    ownership checks, and listing OUTPUT_DIR there would bypass them.
+    """
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=403,
+                            detail="Job listing is self-host only")
+    limit = max(1, min(int(limit or 60), 200))
+    entries = []
+    for meta_path in glob.glob(os.path.join(OUTPUT_DIR, "*", "*_metadata.json")):
+        job_dir = os.path.dirname(meta_path)
+        job_id = os.path.basename(job_dir)
+        base_name = os.path.basename(meta_path).replace("_metadata.json", "")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        clips = []
+        for i, clip in enumerate(data.get("shorts") or []):
+            filename = _canonical_clip_file(job_dir, base_name, i)
+            if not os.path.exists(os.path.join(job_dir, filename)):
+                continue
+            clips.append({
+                "video_url": f"/videos/{job_id}/{filename}",
+                "title": clip.get("video_title_for_youtube_short") or clip.get("title"),
+                "viral_hook_text": clip.get("viral_hook_text"),
+                # The card badges (score, caption verdict) come from the same
+                # metadata the create view reads, so a job looks the same in
+                # the library as it did when it finished.
+                "predicted_score": clip.get("predicted_score"),
+                "caption_review": _rejudge_stale_verdict(
+                    clip, data.get("transcript")),
+            })
+        if not clips:
+            continue
+        entries.append({
+            "job_id": job_id,
+            "label": data.get("video_title") or base_name,
+            "created": os.path.getmtime(meta_path),
+            "clips": clips,
+        })
+    entries.sort(key=lambda e: e["created"], reverse=True)
+    return {"jobs": entries[:limit]}
+
+
 # --- Project restore (paid mode) --------------------------------------------
 # Re-hydrates an archived project from R2 back into output/{job_id}/ so every
 # edit endpoint works on it again. Restored files land with a fresh mtime, so
@@ -2957,7 +3176,8 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
 
 
 from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video
+from subtitles import (generate_srt, generate_ass, burn_subtitles,
+                       generate_srt_from_video, get_caption_style)
 from hooks import add_hook_to_video
 from translate import translate_video, get_supported_languages
 from thumbnail import (analyze_video_for_titles, refine_titles, generate_thumbnail,
@@ -3164,6 +3384,11 @@ class SubtitleRequest(BaseModel):
     effect: str = "none"  # none | glow | pop | box (karaoke only)
     base_opacity: float = 1.0  # opacity of non-active words (dimmed modern look)
     uppercase: bool = False
+    # Caption line budget. Karaoke burns default to the deployment template's
+    # own values: without them the modal re-cut the same words into longer
+    # lines than the pipeline shipped, so a restyle changed the line breaks.
+    max_chars: Optional[int] = None
+    max_duration: Optional[float] = None
     input_filename: Optional[str] = None
     # User-edited caption words. When present, the burn uses them VERBATIM
     # instead of regenerating from the stored transcript — without this, text
@@ -3324,6 +3549,9 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
         "current_file": current_file,
         "has_captions": bool(re.match(r'^subtitled_\d+_', current_file)),
         "words": words_out,
+        "caption_review": clip.get('caption_review'),
+        "genre": data.get('genre'),
+        "content_style": data.get('content_style'),
         "source": {
             "available": bool(source_path),
             "url": _signed_source_url(job_id) if source_path else None,
@@ -3369,6 +3597,40 @@ _rerender_locks: Dict[str, asyncio.Lock] = {}
 # Scene-listing builds write stable preview/thumbnail names per job; serialize
 # them so overlapping editor opens don't tear each other's files.
 _scenes_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _recut_caption_review(v_transcript, total_seconds, reapplied, window=None):
+    """Re-audit the captions a recut/reframe just burned, in stored shape.
+
+    The verdict recorded at selection time describes a range that no longer
+    exists, so a re-render has to replace it rather than inherit it: without
+    this, the library pill certifies text nobody can watch. ``reapplied`` False
+    means the shipped file has no captions at all, which is answered with no
+    verdict instead of a stale one. Never raises — an audit problem must not
+    cost the user the cut they just saved.
+
+    The burn is judged in clip-relative time (the recut transcript starts at
+    zero), but ``clip`` in a stored verdict always names SOURCE seconds, so
+    ``window`` overwrites it with the absolute range this verdict describes.
+    """
+    if not reapplied:
+        return None
+    try:
+        import caption_audit
+        _tpl = get_caption_style()
+        verdict = caption_audit.audit(
+            v_transcript, 0.0, total_seconds,
+            max_chars=_tpl["max_chars"], max_duration=_tpl["max_duration"],
+            karaoke=(_tpl.get("style") == "karaoke"))
+        print(f"   💬 {caption_audit.summary(verdict)}")
+        payload = caption_audit.verdict_payload(verdict)
+        if payload is not None and window is not None:
+            payload["clip"] = [round(float(window[0]), 3),
+                               round(float(window[1]), 3)]
+        return payload
+    except Exception as e:
+        print(f"   ℹ️ Caption audit skipped ({type(e).__name__}: {e})")
+        return None
 
 
 @app.post("/api/clip/rerender")
@@ -3506,6 +3768,12 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
 
         updates = {'video_url': new_video_url, 'start': new_start,
                    'end': new_end, 'recipe': new_recipe,
+                   # What the captions of THIS render read like — see
+                   # _recut_caption_review. Always set, so a cut saved without
+                   # captions drops the verdict recorded for the old ones.
+                   'caption_review': _recut_caption_review(
+                       v_transcript, total, req.reapply_captions,
+                       window=(new_start, new_end)),
                    # The stacked stretches of THIS render (empty on the fast
                    # path, which never reframes): captions follow them.
                    'layout_ranges': layout_ranges.read(
@@ -3536,6 +3804,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             "end": new_end,
             "duration": total,
             "render_path": "fast" if fast else "source",
+            "caption_review": updates["caption_review"],
         }
     except Exception as e:
         if reservation_id:
@@ -3862,6 +4131,10 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
         updates = {
             'video_url': new_video_url,
             'recipe': new_recipe,
+            'caption_review': _recut_caption_review(
+                v_transcript, total, req.reapply_captions,
+                window=(min(s['start'] for s in segments),
+                        max(s['end'] for s in segments))),
             'crop_overrides': {str(k): v for k, v in overrides.items()},
             'layout_ranges': layout_ranges.read(os.path.join(output_dir, _clean)),
         }
@@ -3886,6 +4159,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             "start": min(s['start'] for s in segments),
             "end": max(s['end'] for s in segments),
             "framed_scenes": sorted(overrides),
+            "caption_review": updates["caption_review"],
         }
     except Exception as e:
         if reservation_id:
@@ -4144,6 +4418,12 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     # Define outputs
     generation_id = int(time.time())
     is_karaoke = req.style == "karaoke"
+    # Line budget. Karaoke keeps the deployment template's own breaks — a
+    # restyle that re-wrapped the lines into longer ones would look like the
+    # edit had corrupted the captions.
+    _tpl = get_caption_style()
+    cap_max_chars = int(req.max_chars or (_tpl.get("max_chars") if is_karaoke else 20) or 20)
+    cap_max_dur = float(req.max_duration or (_tpl.get("max_duration") if is_karaoke else 2.0) or 2.0)
     srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
 
@@ -4154,6 +4434,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     seam_ranges = layout_ranges.split_ranges(
         clip_data.get('layout_ranges') or layout_ranges.read(input_path))
     karaoke_opts = dict(
+        max_chars=cap_max_chars, max_duration=cap_max_dur,
         split_ranges=seam_ranges,
         alignment=req.position, fontsize=req.font_size, font_name=req.font_name,
         font_color=req.font_color, border_color=req.border_color,
@@ -4200,7 +4481,9 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         elif is_karaoke:
             success = generate_ass(sub_transcript, sub_start, sub_end, srt_path, **karaoke_opts)
         else:
-            success = generate_srt(sub_transcript, sub_start, sub_end, srt_path)
+            success = generate_srt(sub_transcript, sub_start, sub_end, srt_path,
+                                   max_chars=cap_max_chars,
+                                   max_duration=cap_max_dur)
 
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
@@ -4226,15 +4509,34 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     if reservation_id:
         await _metering.commit_reservation(reservation_id)
 
+    # Re-read the captions we just burned. A user who edited the words to make
+    # them read better needs to know whether they did; the pipeline's verdict
+    # recorded at selection time describes the OLD text.
+    caption_review = None
+    try:
+        import caption_audit
+        verdict = caption_audit.audit(
+            sub_transcript, sub_start, sub_end,
+            max_chars=cap_max_chars, max_duration=cap_max_dur,
+            karaoke=is_karaoke)
+        caption_review = caption_audit.verdict_payload(verdict)
+        print(f"   💬 {caption_audit.summary(verdict)}")
+    except Exception as e:
+        print(f"   ℹ️ Caption audit skipped ({type(e).__name__}: {e})")
+
     # 3. Update Result and Metadata
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
          job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+         if caption_review is not None:
+             job['result']['clips'][req.clip_index]['caption_review'] = caption_review
     
     # Update Metadata on Disk (Persistence)
     try:
         if req.clip_index < len(clips):
             clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+            if caption_review is not None:
+                clips[req.clip_index]['caption_review'] = caption_review
             # Update the main data structure
             data['shorts'] = clips
             
@@ -4250,7 +4552,8 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
 
     return {
         "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+        "new_video_url": f"/videos/{req.job_id}/{output_filename}",
+        "caption_review": caption_review,
     }
 
 class RemoveSubtitlesRequest(BaseModel):

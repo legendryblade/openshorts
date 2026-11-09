@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from clip_selection import (clip_count_targets, clip_duration_bounds,
                             lookup_model_prices)
+import content_profile
 
 load_dotenv()
 
@@ -330,7 +331,7 @@ def _log(message: str) -> None:
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
 Select the MOST viral candidate windows from this batch.
-
+<<EDITORIAL_BRIEF>>
 Rules:
 - Return only valid JSON.
 - Choose up to 3 windows from this batch.
@@ -365,9 +366,11 @@ Return only:
 DETAIL_PROMPT_TEMPLATE = """
 You are a senior short-form video editor and viral copywriter.
 Choose the BEST short clips from these shortlisted candidate windows.
-
+<<EDITORIAL_BRIEF>>
 CONTENT-TYPE AWARENESS — read the transcript FIRST to understand what kind of
-video this is, then apply the right editorial lens:
+video this is, then apply the right editorial lens. If an EDITORIAL BRIEF above
+names the genre, that is the answer — it was decided from the whole transcript,
+so apply its lens instead of re-guessing the content type from these windows:
 - Gaming: hooks = kills, fails, clutch moments, funny reactions, near-misses
 - Podcast/Talk: hooks = hot takes, stories with tension, disagreements, confessions
 - Tutorial/Educational: hooks = "the mistake", the payoff, the "why nobody tells you"
@@ -734,6 +737,13 @@ def main() -> int:
         fmt["min_clips"], fmt["max_clips"] = clip_count_targets(len(payload.get("windows") or []))
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
     prompt = template.format(**fmt)
+    # Standalone worker: no transcript-wide classification here, so the brief is
+    # built from what the operator pinned (CONTENT_GENRE / CONTENT_STYLE). An
+    # unset pair leaves the prompt exactly as it formatted before.
+    prompt = content_profile.apply_brief(
+        prompt,
+        content_profile.build_brief(content_profile.genre_from_env(),
+                                    content_profile.style_from_env()))
 
     _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
     response = client.models.generate_content(

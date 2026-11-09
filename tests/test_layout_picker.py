@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 import types
 
@@ -89,9 +90,15 @@ class TestPick:
 
 class TestValidDecisions:
     def test_every_valid_decision_maps_to_known_modules(self):
-        known = {"split_layout", "screencast_layout", "active_speaker"}
+        # Every flag name must be a module that actually exists — a typo or a
+        # stale name here means apply() silently enables nothing.
+        known = {"split_layout", "screencast_layout", "active_speaker",
+                 "facecam_extractor"}
         for decision in layout_picker.VALID:
-            assert set(_module_flags(decision)) <= known
+            flags = set(_module_flags(decision))
+            assert flags <= known
+            for name in flags:
+                assert importlib.util.find_spec(name), f"{name} maps to no importable module"
 
     def test_none_is_a_valid_decision(self):
         # The model answers "none" for most videos; it must not be treated as
@@ -146,3 +153,23 @@ class TestShadowMode:
         assert "[layout-shadow]" in out
         assert "decision=split" in out
         assert "would_enable=split_layout,active_speaker" in out
+
+
+class TestFirstLayout:
+    """The critique-gate layout lookup: dict rows are the sidecar shape, and
+    indexing them like the old tuple rows killed every clip after captions."""
+
+    def test_dict_rows(self):
+        import layout_ranges
+        rows = [{"start": 0.0, "end": 5.0, "layout": "general"}]
+        assert layout_ranges.first_layout(rows) == "general"
+
+    def test_legacy_tuple_rows(self):
+        import layout_ranges
+        assert layout_ranges.first_layout([(0.0, 5.0, "split")]) == "split"
+
+    def test_empty_and_junk_fall_back(self):
+        import layout_ranges
+        assert layout_ranges.first_layout([]) == "auto"
+        assert layout_ranges.first_layout(None) == "auto"
+        assert layout_ranges.first_layout(["garbage", {}]) == "auto"

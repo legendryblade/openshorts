@@ -25,9 +25,12 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+import caption_audit
+import content_profile
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, estimate_prompt_tokens,
-                            is_daily_quota_error, refine_clip_boundaries,
+                            fit_payload_to_budget, is_daily_quota_error,
+                            refine_clip_boundaries,
                             validate_punch_ins, snap_clip_to_words,
                             TokenPacer, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, QUALITY,
@@ -724,6 +727,33 @@ def plan_download_attempts(direct_first, statics, paid, have_hd, youtube=True):
     return plan
 
 
+def resolve_youtube_cookies():
+    """Turn YOUTUBE_COOKIES into a cookiefile path yt-dlp can use.
+
+    Accepts either an existing Netscape cookies file path (the natural
+    self-host form) or the file's contents pasted straight into the env var
+    (Docker-secrets style). Pasted content goes to the system temp dir —
+    never /app/cookies.txt, which only exists inside the container and made
+    every self-hosted (Windows) install silently download with NO cookies.
+    Returns (path_or_None, status_line). The status line never echoes file
+    content: it can hold live session cookies.
+    """
+    raw = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
+    if not raw:
+        return None, ("⚠️ YOUTUBE_COOKIES env var not found — a datacenter IP is "
+                      "likely to hit YouTube's bot check.")
+    if os.path.isfile(raw):
+        return raw, f"🍪 Using cookies file: {raw}"
+    import tempfile
+    dest = os.path.join(tempfile.gettempdir(), "openshorts_cookies.txt")
+    try:
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(raw if raw.endswith("\n") else raw + "\n")
+        return dest, f"🍪 Wrote YOUTUBE_COOKIES content to {dest} ({os.path.getsize(dest)} bytes)"
+    except OSError as e:
+        return None, f"⚠️ Could not write cookies file: {e}"
+
+
 def download_youtube_video(url, output_dir="."):
     """
     Downloads a YouTube video using yt-dlp.
@@ -742,23 +772,8 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
-        try:
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 # Never print file CONTENT here: with a headerless cookies
-                 # blob this would leak live YouTube session cookies to logs.
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-        except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
-            cookies_path = None
-    else:
-        cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+    cookies_path, cookies_msg = resolve_youtube_cookies()
+    print(cookies_msg)
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
     # (self-host) goes direct as before.
@@ -1007,7 +1022,10 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         return None  # silent video: nothing to caption
     try:
         import subtitles as _subs
-        style = _subs.AUTO_CAPTION_STYLE
+        # The deployment's caption template (CAPTION_TEMPLATE env, settable
+        # live from the Settings UI); per-field overrides the client sends
+        # still apply on top through /api/subtitle.
+        style = _subs.get_caption_style()
         output_dir = os.path.dirname(clip_path)
         stem = os.path.basename(clip_path)
         generation_id = int(time.time())
@@ -1051,6 +1069,19 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
                 base_opacity=style["base_opacity"], uppercase=style["uppercase"]):
             print("   ℹ️ No words in range — clip ships without captions.")
             return None
+
+        # Log whether what we are about to burn reads like speech. Selection
+        # already recorded this in the metadata; this catches every path that
+        # captions without going through selection (the modal's re-caption,
+        # recut, /api/subtitle), where nobody else looks at the text.
+        try:
+            verdict = caption_audit.audit(
+                transcript, clip_start, clip_end,
+                max_chars=style["max_chars"], max_duration=style["max_duration"],
+                karaoke=(style.get("style") == "karaoke"))
+            print(f"   💬 {caption_audit.summary(verdict)}")
+        except Exception as e:
+            print(f"   ℹ️ Caption audit skipped ({type(e).__name__}: {e})")
 
         _subs.burn_subtitles(
             clip_path, ass_path, out_path,
@@ -1477,6 +1508,39 @@ def transcribe_video(video_path):
 
     return transcript
 
+def _is_transient_error(error=None, message=""):
+    """True for the provider hiccups worth another attempt.
+
+    One list, two uses: the inner per-call retry ladder and the job-level
+    retry around clip detection (a free endpoint that answers "empty response
+    body" three times running can still be healthy a minute later).
+    ``error`` may carry ``status_code`` (a 429 counts as transient).
+    """
+    if getattr(error, "status_code", None) == 429:
+        return True
+    text = str(message) if message else str(error or "")
+    return any(tok in text for tok in _TRANSIENT_TOKENS)
+
+
+_TRANSIENT_TOKENS = (
+    '503', 'UNAVAILABLE',
+    '500', 'INTERNAL', 'overloaded', 'Deadline',
+    'empty response body', 'did not contain a JSON object',
+    'Failed to parse Gemini JSON response',
+    # The server's JSON validator refusing the model's output: the
+    # same class of flake as Gemini's empty body above, and a retry
+    # (on a looser response_format) recovers it.
+    'json_validate_failed', 'Failed to validate JSON',
+    # OpenAI-compatible servers: model still loading, busy, or a
+    # small model that skipped a required field this time.
+    'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
+    'validation error',
+    # Windows TCP RST: the same network flake that kills git
+    # clones and pip installs on this connection (16+-sep logs).
+    'forcibly closed', '10054', 'WinError 10054',
+    'connection was reset', 'Connection reset')
+
+
 def _run_gemini_stage(client, model_name, prompt, schema):
     """One schema-enforced model call with transient-error backoff.
     Returns (parsed_dict, cost_analysis).
@@ -1559,23 +1623,7 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                       f"window to refill: {msg[:120]}")
                 time.sleep(wait)
                 continue
-            transient = any(tok in msg for tok in (
-                '503', 'UNAVAILABLE',
-                '500', 'INTERNAL', 'overloaded', 'Deadline',
-                'empty response body', 'did not contain a JSON object',
-                'Failed to parse Gemini JSON response',
-                # The server's JSON validator refusing the model's output: the
-                # same class of flake as Gemini's empty body above, and a retry
-                # (on a looser response_format) recovers it.
-                'json_validate_failed', 'Failed to validate JSON',
-                # OpenAI-compatible servers: model still loading, busy, or a
-                # small model that skipped a required field this time.
-                'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-                'validation error',
-                # Windows TCP RST: the same network flake that kills git
-                # clones and pip installs on this connection (16+-sep logs).
-                'forcibly closed', '10054', 'WinError 10054',
-                'connection was reset', 'Connection reset'))
+            transient = _is_transient_error(message=msg)
             attempt += 1
             if attempt >= max_attempts or not transient:
                 raise
@@ -1623,6 +1671,66 @@ def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs
         print(f"   🚫 {label}: Gemini blocked a batch of {len(items)}; retrying as {mid} + {len(items) - mid}")
         return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label)
                 + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label))
+    except RuntimeError as e:
+        # 413 "Request too large": the provider's per-minute limit is smaller
+        # than the request itself, so waiting and key rotation cannot help.
+        # fit_payload_to_budget normally prevents this by trimming window text
+        # up front; this split is the backstop for material where the
+        # chars/token estimate was optimistic. Halving the batch halves the
+        # payload; a single window that still 413s is skipped with the reason.
+        if "413" in str(e) or "request too large" in str(e).lower():
+            if len(items) == 1:
+                print(f"   🚫 {label}: window {items[0].get('id')} alone exceeds the "
+                      f"token limit; skipping it ({str(e)[:120]})")
+                return []
+            mid = len(items) // 2
+            print(f"   ✂️ {label}: request too large ({str(e)[:80]}…); retrying as {mid} + {len(items) - mid}")
+            return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label)
+                    + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label))
+        raise
+
+
+def detect_genre(client, model_name, transcript_result, costs):
+    """Classify the source ONCE before scoring, and build the editorial brief.
+
+    Returns (genre_key, brief). The one cheap call buys the lens every later
+    prompt uses — a gaming VOD scored with podcast criteria is why "find the
+    funny moments" and "find the peak moments" used to return the same clips.
+
+    Never fatal: a policy block, a 413 or an exhausted quota costs the lens and
+    nothing else, because an empty brief leaves both prompts byte-identical to
+    how they rendered before this existed.
+    """
+    sample = content_profile.prompt_sample(transcript_result)
+    pinned = content_profile.genre_from_env()
+    style = content_profile.style_from_env()
+    if pinned:
+        # CONTENT_GENRE is set: the operator knows better than a transcript
+        # sample (silent screencasts and game-noise VODs classify badly), and
+        # re-running with another lens should not pay for detection.
+        print(f"   Genre: {pinned} (pinned by CONTENT_GENRE; style: {style})")
+        return pinned, content_profile.build_brief(pinned, style)
+    if not sample.strip():
+        return "general", content_profile.build_brief("general", style)
+    prompt = content_profile.GENRE_PROMPT_TEMPLATE.format(
+        genre_list=content_profile.genre_labels(), sample=sample)
+    try:
+        parsed, cost = _run_gemini_stage(
+            client, model_name, prompt, content_profile.GenreResponse)
+    except Exception as e:
+        # Losing the lens must not lose the user's request: the style half of
+        # the brief still says whether they asked for funny or peak moments.
+        print(f"   Genre detection unavailable, scoring with the style brief only "
+              f"({str(e)[:120]})")
+        return "general", content_profile.build_brief("general", style)
+    if cost:
+        costs.append(cost)
+    genre = content_profile.normalize_genre(parsed.get("genre"))
+    evidence = str(parsed.get("evidence") or "").strip()[:160]
+    brief = content_profile.build_brief(genre, style, evidence=evidence)
+    print(f"   Genre: {genre} (style: {style})"
+          + (f" — {evidence}" if evidence else ""))
+    return genre, brief
 
 
 def score_batch_size():
@@ -1648,6 +1756,14 @@ def score_batch_size():
 # overrides it for a provider that advertises nothing.
 _PACER = TokenPacer()
 _EXPECTED_OUTPUT_TOKENS = 400  # gpt-oss spends real tokens on reasoning
+
+
+def _tpm_budget():
+    """The per-request ceiling to fit inside: LLM_TPM_LIMIT, else the pacer's
+    limit learned from response headers, else the documented Groq free-tier
+    8000. Used to size requests BEFORE they are sent — see
+    fit_payload_to_budget for why pacing alone can't fix a 413."""
+    return llm_tpm_limit() or _PACER.limit_tokens or 8000
 
 
 def _env_count(name, default, minimum=0):
@@ -1754,6 +1870,10 @@ def get_viral_clips(transcript_result, video_duration):
         print(f"   Built {len(windows)} scoring window(s).")
         costs = []
 
+        # Know what the video IS before judging it: one cheap classification over
+        # a sample of the whole transcript, so the lens is not guessed per batch.
+        genre, editorial_brief = detect_genre(client, model_name, transcript_result, costs)
+
         # --- Pass 1: score windows in batches, keep the highest-scoring ---
         scored = []
         # Local models usually run with a 4-8k context (Ollama defaults to
@@ -1763,10 +1883,42 @@ def get_viral_clips(transcript_result, video_duration):
         def _payload(ws):
             return [{"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]} for w in ws]
 
+        # Fit each request to the token budget BEFORE it is sent: a provider
+        # whose per-minute limit is smaller than the request itself answers
+        # 413 ("Requested 8051 > Limit 8000"), and neither waiting nor a key
+        # pool shrinks a request. Budget = TPM − expected output − headroom,
+        # re-read per call so a limit learned from response headers mid-run
+        # takes effect; 0 disables fitting (Gemini's 1M context needs none).
+        def _fit_budget():
+            return max(0, _tpm_budget() - _EXPECTED_OUTPUT_TOKENS - 300)
+
+        def _fit_payload(ws, template, **fields):
+            payload = _payload(ws)
+            budget = _fit_budget()
+            if not budget:
+                return payload
+            # Measure the overhead WITH the brief in it: the brief is ~400
+            # tokens of text the provider really receives, and leaving it out of
+            # the estimate is how a "fitted" request still 413s.
+            overhead = len(content_profile.apply_brief(
+                template.format(windows_json="", **fields), editorial_brief))
+            before = sum(len(w.get("text") or "") for w in payload)
+            fitted = fit_payload_to_budget(payload, budget,
+                                           template_chars=overhead)
+            if sum(len(w.get("text") or "") for w in fitted) < before:
+                print("   ✂️ Trimmed window text to fit the token budget "
+                      "(a larger request would 413).")
+            return fitted
+
         def _score_prompt(ws):
-            return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
-                video_duration=video_duration, language=language,
-                windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+            return content_profile.apply_brief(
+                gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+                    video_duration=video_duration, language=language,
+                    windows_json=json.dumps(_fit_payload(
+                        ws, gemini_worker.SCORE_PROMPT_TEMPLATE,
+                        video_duration=video_duration, language=language),
+                        ensure_ascii=False)),
+                editorial_brief)
 
         batches = [windows[b:b + SCORE_BATCH]
                    for b in range(0, len(windows), SCORE_BATCH)]
@@ -1805,11 +1957,21 @@ def get_viral_clips(transcript_result, video_duration):
         def _detail_prompt(ws):
             # A split batch keeps the full clip-count band: a short list can
             # still hold the best clips, and the model returns fewer anyway.
-            return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
-                video_duration=video_duration, language=language,
-                min_clips=min_clips, max_clips=max_clips,
-                min_secs=min_secs, max_secs=max_secs,
-                windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+            # One verbose window + the template can still exceed an 8K TPM
+            # budget on its own — fit_payload trims setup/payoff-preserving
+            # text so the request lands inside the ceiling.
+            return content_profile.apply_brief(
+                gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+                    video_duration=video_duration, language=language,
+                    min_clips=min_clips, max_clips=max_clips,
+                    min_secs=min_secs, max_secs=max_secs,
+                    windows_json=json.dumps(_fit_payload(
+                        ws, gemini_worker.DETAIL_PROMPT_TEMPLATE,
+                        video_duration=video_duration, language=language,
+                        min_clips=min_clips, max_clips=max_clips,
+                        min_secs=min_secs, max_secs=max_secs),
+                        ensure_ascii=False)),
+                editorial_brief)
 
         # Batch the detail pass too: 10 verbose gaming windows + the prompt
         # template can exceed an 8K TPM budget in a single call (the 413 that
@@ -1838,7 +2000,33 @@ def get_viral_clips(transcript_result, video_duration):
             if (rs, re_) != (ns, ne):
                 print(f"   ✂️ Trimmed dead air: {ns:.1f}-{ne:.1f} -> {rs:.1f}-{re_:.1f} "
                       f"({ne - ns:.0f}s -> {re_ - rs:.0f}s)")
+            # A cut can sit in a perfect pause and still chop a sentence in half.
+            # Move it onto the sentence boundary while the clip is still just
+            # numbers, i.e. before anything is cut, rendered or captioned.
+            ps, pe, repair_notes = caption_audit.repair_range(
+                transcript_result, rs, re_, video_duration,
+                min_duration=min_secs, max_duration=max_secs)
+            for note in repair_notes:
+                print(f"   📝 Cut re-anchored to the sentence: {note}")
+            rs, re_ = ps, pe
             s["start"], s["end"] = rs, re_
+            # Did the captions for this range actually say something? Measured
+            # on the renderer's own blocks, at the template's line length, so
+            # the verdict is about the text the viewer will read. Recorded in
+            # the metadata and printed; never gates the clip.
+            try:
+                import subtitles as _subs
+                _style = _subs.get_caption_style()
+                verdict = caption_audit.audit(
+                    transcript_result, rs, re_,
+                    max_chars=_style["max_chars"],
+                    max_duration=_style["max_duration"],
+                    karaoke=(_style.get("style") == "karaoke"))
+                s["caption_review"] = caption_audit.verdict_payload(verdict)
+                if not verdict["ok"]:
+                    print(f"   ⚠️ {caption_audit.summary(verdict)}")
+            except Exception as e:
+                print(f"   ℹ️ Caption audit skipped ({type(e).__name__}: {e})")
             # Re-base the model's punch-in times onto the TRIMMED clip and
             # keep only renderer-usable ones (in-range, spaced, clamped).
             pins = refine_clip_boundaries and validate_punch_ins(
@@ -1864,6 +2052,10 @@ def get_viral_clips(transcript_result, video_duration):
             return None
 
         result = {"shorts": shorts}
+        # Recorded for the dashboard and the editor: which lens these clips were
+        # picked through, so a re-run can pin the same one.
+        result["genre"] = genre
+        result["content_style"] = content_profile.style_from_env()
         if cost_analysis:
             result["cost_analysis"] = cost_analysis
         return result
@@ -2158,7 +2350,20 @@ if __name__ == '__main__':
 
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         if transcript is not None:
-            clips_data = get_viral_clips(transcript, duration)
+            try:
+                clips_data = get_viral_clips(transcript, duration)
+            except Exception as e:
+                # One job-level retry on a TRANSIENT provider failure: free
+                # endpoints (OpenRouter :free, overloaded providers) answer
+                # "empty response body" in bursts, and the inner 3-attempt
+                # ladder can still lose all three. The transcript is already
+                # in hand, so the retry costs only another scoring pass.
+                if not _is_transient_error(e, str(e)):
+                    raise
+                print(f"⚠️ Clip detection hit a transient provider error "
+                      f"({str(e)[:100]}); retrying once in 60s...")
+                time.sleep(60)
+                clips_data = get_viral_clips(transcript, duration)
         else:
             clips_data = get_visual_clips(input_video, duration)
 
@@ -2259,8 +2464,13 @@ if __name__ == '__main__':
                                     # Mirror deliver_path: the captioned file
                                     # replaces the canonical one on success.
                                     os.replace(cap2, clip_final_path)
-                            _last_layout = (clip['layout_ranges'][0][2]
-                                            if clip.get('layout_ranges') else "auto")
+                            # The sidecar rows are dicts ({start, end, layout});
+                            # older code indexed them like tuples, which made
+                            # EVERY clip die with KeyError: 2 right after captions
+                            # burned — the job wrote files but reported no clips.
+                            import layout_ranges as _lr_mod
+                            _last_layout = _lr_mod.first_layout(
+                                clip.get('layout_ranges'))
                             critique_gate.gate(final_deliver, redo_fn=_redo_simple,
                                                layout=_last_layout)
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")

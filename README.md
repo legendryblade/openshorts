@@ -1,3 +1,14 @@
+> ## This is a modified fork
+> Public build of the **self-hosted clip pipeline** (source: `mutonby/openshorts`).
+> Heavily modified for a Groq-only zero-GPU workflow: cloud ASR, rotating key
+> pool, request-size budgeting, detached job workers, self-healing watchdog,
+> Cloudflare tunnel bootstrap, 9 caption templates, and a rebuilt web UI.
+>
+> **Read [`PRODUCT-README.md`](PRODUCT-README.md) for how to run it, and
+> [`HANDOVER.md`](HANDOVER.md) for the architecture, env vars, and every bug
+> this fork has fixed.** The upstream README below describes the wider
+> platform (UGC/Studio/billing) that this deployment does not enable.
+
 # OpenShorts.app
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -88,6 +99,9 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 - **AI Voice Dubbing**: ElevenLabs integration for 30+ languages with voice cloning
 - **Hook Text Overlays**: AI-generated attention-grabbing text overlays
 - **AI Video Effects**: Gemini-generated FFmpeg filters for professional effects
+- **Knows What It's Looking At**: every job classifies the source's genre (podcast, gaming, tutorial, vlog…) and the look you asked for (`content_style=funny|peak|general`) before scoring, and the resulting editorial brief — what makes a clip work in this video, what not to pick, how the captions should break — is spliced into both selection prompts
+- **Caption Audit**: every clip's burned text is measured before it ships (reading pace, sentence boundaries, transcription loops, hallucinated boilerplate, transcripts denser than the audio can hold) and the cut is re-anchored to a sentence boundary when the model's window chopped one in half; the verdict rides in the metadata and shows on the clip card, and any edit that re-burns captions (re-cut, re-frame, restyle) re-measures it instead of inheriting the old verdict
+- **Clip editor in the web UI**: drag the cut on a word-level source timeline, split a clip into segments or merge the gap back, rewrite any caption word, restyle the captions (template, size, colours, outline, effect, line length), re-frame each scene by hand and re-burn the hook text — all from `localhost` without the dashboard app
 
 ### AI Shorts Pipeline
 1. **Analyze**: Scrape website URL + web research, or generate from manual description
@@ -255,7 +269,7 @@ services:
 
 **`.env`:**
 ```
-WHISPER_MODEL=large-v3-turbo
+WHISPER_MODEL=large-v3
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE=float16
 FFMPEG_ENCODER=auto           # probes h264_nvenc at startup, falls back to x264

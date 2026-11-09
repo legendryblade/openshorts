@@ -123,10 +123,13 @@ class TestDrain:
                 await asyncio.sleep(0.2)
                 app_module._running_jobs.discard("j1")
             asyncio.create_task(finish_soon())
-            t = time.time()
+            # monotonic, not time.time(): asyncio sleeps on the monotonic clock,
+            # and the wall clock can sit slightly behind it (NTP slew), which
+            # measured a real 0.3 s grace as 0.292 s and failed the sibling test.
+            t = time.monotonic()
             await app_module._drain_then_exit(lambda sig, frame: calls.append(sig),
                                               timeout=5, proxy_grace=0, hard_exit_after=0)
-            return time.time() - t
+            return time.monotonic() - t
         waited = asyncio.run(scenario())
         assert calls and waited >= 0.2
 
@@ -139,10 +142,10 @@ class TestDrain:
 
     def test_keeps_serving_for_the_proxy_grace_after_draining(self, out):
         calls = []
-        t = time.time()
+        t = time.monotonic()
         asyncio.run(app_module._drain_then_exit(lambda sig, frame: calls.append(sig),
                                                 timeout=1, proxy_grace=0.3, hard_exit_after=0))
-        assert calls and time.time() - t >= 0.3
+        assert calls and time.monotonic() - t >= 0.3
 
     def test_arms_a_hard_exit_after_handing_the_signal_on(self, out, monkeypatch):
         armed = []

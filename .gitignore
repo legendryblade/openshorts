@@ -27,6 +27,8 @@ output/
 
 # Secrets
 .env
+# Backups made while swapping keys carry the same live API keys as .env itself.
+.env.bak*
 
 # Generated metadata
 *_metadata.json
@@ -47,3 +49,21 @@ skills-lock.json
 # Cloud env example kept local only (avoid leaking infra hints)
 .env.cloud.example
 .worktrees
+
+# Job outputs and server runtime
+output/
+*.log
+# The watchdog rotates on restart, and the rotated name ends in the timestamp.
+*.log.[0-9]*
+
+# PyInstaller / PyArmor build artifacts
+build/
+dist/
+main.build/
+main.dist/
+.pyarmor/
+*.spec.bak
+
+# superseded UI backup (not for public repos)
+static_ui/index.pre-redesign.html
+tunnel-url.txt

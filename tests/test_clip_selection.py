@@ -1,4 +1,5 @@
 """Tests for the pure clip-selection helpers (windows, snapping, pricing)."""
+import json
 import re
 
 import pytest
@@ -215,3 +216,64 @@ class TestTrimToBest:
     def test_max_clips_is_never_below_one(self):
         shorts = [self._clip(0, 10), self._clip(50, 20)]
         assert len(trim_to_best(shorts, 0)) == 1
+
+
+# --- budget fitting (the 413 fix) -------------------------------------------
+
+from clip_selection import fit_payload_to_budget, trim_window_text  # noqa: E402
+
+
+class TestTrimWindowText:
+    def test_short_text_is_untouched(self):
+        assert trim_window_text("hello there", 100) == "hello there"
+
+    def test_long_text_keeps_head_and_tail(self):
+        text = "SETUP " * 200 + "PAYOFF"
+        out = trim_window_text(text, 50)
+        assert out.startswith("SETUP")
+        assert out.endswith("PAYOFF")
+        assert "…[middle trimmed]…" in out
+        assert len(out) < len(text)
+
+    def test_zero_budget_returns_text_unchanged(self):
+        assert trim_window_text("x" * 500, 0) == "x" * 500
+
+
+class TestFitPayloadToBudget:
+    def _w(self, text, i=0):
+        return {"id": f"w{i}", "start": i * 60.0, "end": i * 60.0 + 60.0, "text": text}
+
+    def test_under_budget_is_a_noop(self):
+        payload = [self._w("short text")]
+        out = fit_payload_to_budget(payload, budget_tokens=8000)
+        assert out[0]["text"] == "short text"
+
+    def test_over_budget_trims_every_window(self):
+        payload = [self._w("word " * 1000, 0), self._w("chatter " * 1000, 1)]
+        out = fit_payload_to_budget(payload, budget_tokens=300, template_chars=0)
+        assert all(len(w["text"]) < 5000 for w in out)
+        assert sum(len(w["text"]) for w in out) <= int(300 * 2.6)
+
+    def test_fitted_payload_estimate_stays_inside_budget(self):
+        # The property that matters: estimate_prompt_tokens of the rebuilt
+        # prompt must fit, or the provider 413s the request. ±2% tolerance
+        # because the chars/token heuristic is itself an estimate; main.py
+        # subtracts a 300-token headroom on top.
+        payload = [self._w("filler " * 4000, 0)]
+        fitted = fit_payload_to_budget(payload, budget_tokens=2000, template_chars=500)
+        rebuilt = '{"windows":' + json.dumps(fitted, ensure_ascii=False) + '}'
+        from clip_selection import estimate_prompt_tokens
+        assert estimate_prompt_tokens("x" * 500 + rebuilt) <= 2000 * 1.02
+
+    def test_budget_zero_disables_fitting(self):
+        payload = [self._w("word " * 1000)]
+        out = fit_payload_to_budget(payload, budget_tokens=0)
+        assert out[0]["text"] == "word " * 1000
+
+    def test_template_overhead_shrinks_the_window_share(self):
+        payload = [self._w("word " * 1000)]
+        small = fit_payload_to_budget([self._w("word " * 1000)],
+                                      budget_tokens=2000, template_chars=0)
+        large_overhead = fit_payload_to_budget([self._w("word " * 1000)],
+                                               budget_tokens=2000, template_chars=4000)
+        assert len(large_overhead[0]["text"]) < len(small[0]["text"])

@@ -10,6 +10,7 @@ import os
 import pytest
 
 import clip_selection
+import content_profile as cp
 
 
 @pytest.fixture(autouse=True)
@@ -47,9 +48,14 @@ class TestClipDurationBounds:
 
 def _templates():
     """The prompt template constants, read without importing gemini_worker
-    (which pulls google-genai — absent in the thin CI env)."""
+    (which pulls google-genai — absent in the thin CI env).
+
+    encoding="utf-8" is load-bearing: these sources carry emoji, and Windows
+    defaults to cp1252, which cannot decode them.
+    """
     mod = ast.parse(open(os.path.join(os.path.dirname(__file__), "..",
-                                      "gemini_worker.py")).read())
+                                      "gemini_worker.py"),
+                         encoding="utf-8").read())
     return {
         node.targets[0].id: node.value.value
         for node in mod.body
@@ -79,3 +85,22 @@ class TestPromptTemplates:
         # only its classic keys must keep working.
         _templates()["SCORE_PROMPT_TEMPLATE"].format(
             video_duration=100, language="es", windows_json="[]")
+
+    def test_editorial_brief_is_spliced_after_format(self):
+        # The brief arrives by sentinel replacement, not as a new {field}, so
+        # every existing .format() call site above keeps working untouched.
+        for name in ("SCORE_PROMPT_TEMPLATE", "DETAIL_PROMPT_TEMPLATE"):
+            text = _templates()[name]
+            assert text.count(cp.BRIEF_MARKER) == 1, name
+            assert cp.BRIEF_MARKER not in cp.apply_brief(text, "GENRE: gaming")
+            assert "GENRE: gaming" in cp.apply_brief(text, "GENRE: gaming")
+            # An absent brief leaves the prompt as it rendered before.
+            assert cp.BRIEF_MARKER not in cp.apply_brief(text, "")
+
+    def test_genre_prompt_formats_with_the_classic_keys(self):
+        # The classification prompt lives with the genre table, not in
+        # gemini_worker, so it needs no gemini_worker keys at all.
+        text = cp.GENRE_PROMPT_TEMPLATE.format(
+            genre_list=cp.genre_labels(), sample="hello world")
+        assert "hello world" in text
+        assert '{"genre":' in text

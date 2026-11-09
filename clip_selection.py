@@ -440,6 +440,65 @@ def estimate_prompt_tokens(prompt, chars_per_token=2.6):
     return max(1, int(len(str(prompt or "")) / max(0.5, float(chars_per_token))))
 
 
+def trim_window_text(text, max_chars):
+    """Keep a window's setup and payoff when its middle has to go.
+
+    Verbose transcripts bury the moment: a 60-second window of repeated
+    filler can carry 6k tokens, and the moment sits in the first and last
+    exchanges. Head (the setup) + tail (the reaction) preserved, middle
+    elided with a visible marker so the model knows text is missing. The
+    marker counts toward ``max_chars`` — the result never exceeds the cap.
+    """
+    text = str(text or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = " …[middle trimmed]… "
+    body = max(1, max_chars - len(marker))
+    head = max(1, int(body * 0.6))
+    tail = max(1, body - head)
+    if head + tail >= len(text):
+        return text
+    return text[:head].rstrip() + marker + text[-tail:].lstrip()
+
+
+def fit_payload_to_budget(payload, budget_tokens, template_chars=0,
+                          chars_per_token=2.6):
+    """Shrink window texts until prompt+payload fits the token budget.
+
+    A provider whose per-minute TPM limit is smaller than the REQUEST itself
+    answers 413 — "Request too large … Limit 8000, Requested 8051" — and no
+    amount of waiting, batching or key rotation helps: every key has the same
+    ceiling and the request size never changes. The only lever is sending a
+    smaller request, which is what this does: each window's text is scaled
+    down proportionally (never below a floor) with setup/payoff kept.
+
+    ``budget_tokens`` of 0/None disables fitting (Gemini's 1M context needs
+    no such thing). ``template_chars`` is the prompt template's own fixed
+    length; the JSON scaffolding around each window is charged against the
+    budget too, so the estimate stays honest.
+    Returns the same list, mutated — callers pass a freshly built payload.
+    """
+    if not payload or not budget_tokens:
+        return payload
+    # ~60 chars of keys/braces per window when the payload is json.dumps'd.
+    per_window_overhead = 60
+    budget_chars = (int(budget_tokens * chars_per_token)
+                    - int(template_chars or 0)
+                    - len(payload) * per_window_overhead)
+    if budget_chars <= 0:
+        return payload
+    total = sum(len(str(w.get("text") or "")) for w in payload)
+    if total <= budget_chars:
+        return payload
+    scale = budget_chars / float(total)
+    for w in payload:
+        text = str(w.get("text") or "")
+        # Floor keeps a window usable; the proportional share is the target.
+        cap = max(160, int(len(text) * scale))
+        w["text"] = trim_window_text(text, cap)
+    return payload
+
+
 def is_daily_quota_error(message):
     """True when a 429 is a DAY quota rather than a per-minute one.
 

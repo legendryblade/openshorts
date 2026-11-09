@@ -28,10 +28,15 @@ def _write(path, body="x"):
 def workdir(tmp_path, monkeypatch):
     """A throwaway output/ + uploads/ tree, with the in-memory stores emptied.
 
-    app.py holds OUTPUT_DIR / UPLOAD_DIR as relative paths, so chdir is enough
-    to redirect every write the purge can make.
+    OUTPUT_DIR is whatever .env says — an absolute path on a real machine — so
+    chdir alone no longer redirects the purge. Pin all three roots to the
+    throwaway tree instead; the assertions stay relative because the fixture
+    also chdirs.
     """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(app, "OUTPUT_DIR", "output")
+    monkeypatch.setattr(app, "UPLOAD_DIR", "uploads")
+    monkeypatch.setattr(app, "THUMBNAILS_DIR", os.path.join("output", "thumbnails"))
     os.makedirs("output/thumbnails", exist_ok=True)
     os.makedirs("uploads", exist_ok=True)
     monkeypatch.setattr(app, "jobs", {})

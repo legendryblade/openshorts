@@ -240,6 +240,14 @@ SAFE_MARGIN_V = int(os.environ.get("CAPTION_MARGIN_V", "43"))
 # so the active word reads instantly on any background; the base text stays
 # fully opaque (dimming it tested worse over bright scenes). This is a starting
 # point, not a cage — the subtitle modal still overrides every field.
+#
+# CAPTION_TEMPLATES are named variations of that look, selectable per
+# deployment via CAPTION_TEMPLATE (live-appliable through /api/provider-config
+# and the Settings UI). Every template renders through the same
+# generate_ass path — they differ only in the style fields, so a template can
+# never break the burn. Font stays "Anton" (the one font bundled in fonts/)
+# across the pack: a template naming a missing font would silently render
+# Verdana and look nothing like its preview.
 AUTO_CAPTION_STYLE = {
     "style": "karaoke",
     "alignment": "bottom",
@@ -255,6 +263,103 @@ AUTO_CAPTION_STYLE = {
     "max_chars": 16,
     "max_duration": 1.4,
 }
+
+CAPTION_TEMPLATES = {
+    # The original look (identical to AUTO_CAPTION_STYLE above).
+    "default": dict(AUTO_CAPTION_STYLE),
+    # Big text, electric-cyan active word — the archetypal TikTok look.
+    "tiktok_bold": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Anton",
+        "font_size": 50, "font_color": "#FFFFFF", "highlight_color": "#00E5FF",
+        "border_color": "#000000", "border_width": 6, "effect": "pop",
+        "base_opacity": 1.0, "uppercase": True, "max_chars": 14,
+        "max_duration": 1.2,
+    },
+    # Dimmed base words, bright yellow active word, heavy outline — the
+    # "one word at a time" Hormozi treatment. base_opacity does the dimming.
+    "hormozi": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Anton",
+        "font_size": 48, "font_color": "#FFFFFF", "highlight_color": "#FFE500",
+        "border_color": "#000000", "border_width": 5, "effect": "pop",
+        "base_opacity": 0.45, "uppercase": True, "max_chars": 14,
+        "max_duration": 1.0,
+    },
+    # Smaller, sentence case, thin outline, glow instead of pop — for
+    # screen-casts and talking heads where huge text covers the content.
+    "minimal_clean": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Anton",
+        "font_size": 34, "font_color": "#F5F5F5", "highlight_color": "#FFD700",
+        "border_color": "#101010", "border_width": 2, "effect": "glow",
+        "base_opacity": 0.85, "uppercase": False, "max_chars": 22,
+        "max_duration": 2.0,
+    },
+    # Yellow body, red active word, thick box — the anime-subtitle look.
+    "anime": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Anton",
+        "font_size": 46, "font_color": "#FFEB3B", "highlight_color": "#FF1744",
+        "border_color": "#000000", "border_width": 4, "effect": "box",
+        "base_opacity": 1.0, "uppercase": True, "max_chars": 14,
+        "max_duration": 1.4,
+    },
+    # Extra-large with a green active word — high-energy gaming/V Felix style.
+    "mrbeast": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Anton",
+        "font_size": 52, "font_color": "#FFFFFF", "highlight_color": "#00FF66",
+        "border_color": "#000000", "border_width": 6, "effect": "pop",
+        "base_opacity": 1.0, "uppercase": True, "max_chars": 13,
+        "max_duration": 1.2,
+    },
+    # Small, dimmed, blue highlight in a soft box — podcasts and interviews.
+    "podcast_soft": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Anton",
+        "font_size": 32, "font_color": "#E0E0E0", "highlight_color": "#6CB6FF",
+        "border_color": "#000000", "border_width": 2, "effect": "box",
+        "base_opacity": 0.8, "uppercase": False, "max_chars": 24,
+        "max_duration": 2.2,
+    },
+    # Cyan glow on dark — tech/product demos.
+    "neon_glow": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Anton",
+        "font_size": 44, "font_color": "#FFFFFF", "highlight_color": "#00FFF7",
+        "border_color": "#000000", "border_width": 3, "effect": "glow",
+        "base_opacity": 0.9, "uppercase": True, "max_chars": 16,
+        "max_duration": 1.4,
+    },
+    # Green-on-black box, wider lines — the retro terminal joke template.
+    "retro_terminal": {
+        "style": "karaoke", "alignment": "bottom", "font_name": "Verdana",
+        "font_size": 30, "font_color": "#33FF33", "highlight_color": "#FFFFFF",
+        "border_color": "#000000", "border_width": 2, "effect": "box",
+        "base_opacity": 1.0, "uppercase": True, "max_chars": 26,
+        "max_duration": 2.0,
+    },
+}
+
+_VALID_EFFECTS = {"none", "glow", "pop", "box"}
+
+
+def get_caption_style(name=None):
+    """The style dict for a caption template, falling back safely.
+
+    Resolution order: explicit ``name`` argument, else the CAPTION_TEMPLATE
+    env var (live-settable from the UI), else "default". An unknown or
+    malformed template name degrades to the default look instead of failing
+    the burn — a bad template must never cost the clip its captions. Returns
+    a copy: callers mutate the dict freely (per-clip overrides).
+    """
+    import re as _re
+    key = (name or os.environ.get("CAPTION_TEMPLATE") or "default")
+    key = str(key).strip().lower()
+    style = CAPTION_TEMPLATES.get(key)
+    if style is None:
+        style = CAPTION_TEMPLATES["default"]
+    style = dict(style)
+    if style.get("effect") not in _VALID_EFFECTS:
+        style["effect"] = "pop"
+    for field in ("font_color", "highlight_color", "border_color"):
+        if not _re.fullmatch(r"#[0-9A-Fa-f]{6}", str(style.get(field, ""))):
+            style[field] = "#FFFFFF"
+    return style
 
 
 def _ass_time(seconds):

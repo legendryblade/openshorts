@@ -112,6 +112,18 @@ def _get_whisper_model():
     key = (cfg["model_size"], cfg["device"], cfg["compute_type"])
     with _whisper_lock:
         if _whisper_model is None or _whisper_key != key:
+            if "turbo" in key[0]:
+                # Everything downstream reads word timings: snap_clip_to_words
+                # cuts on them and the karaoke ASS highlights them one word at
+                # a time. Turbo is the fast checkpoint, not the accurate one,
+                # and the repo's own troubleshooting table lists it as the
+                # cause of desynced captions. Warn instead of silently
+                # upgrading: the operator chose it for a reason (speed), and a
+                # surprise 3x slower job is worse than a line in the log.
+                print(f"   ⚠️ [ASR] WHISPER_MODEL={key[0]} is a turbo checkpoint. "
+                      "Word timings will be looser than whisper-large-v3 and "
+                      "karaoke captions can drift; set WHISPER_MODEL=large-v3 "
+                      "when caption quality matters more than speed.")
             from faster_whisper import WhisperModel
             _whisper_model = WhisperModel(key[0], device=key[1], compute_type=key[2])
             _whisper_key = key
@@ -159,7 +171,22 @@ def run_whisper_transcription(media_path, **params):
 
 
 def _transcribe_with_whisper(media_path):
-    segments, info = run_whisper_transcription(media_path, **WHISPER_TRANSCRIBE_PARAMS)
+    try:
+        segments, info = run_whisper_transcription(media_path, **WHISPER_TRANSCRIBE_PARAMS)
+    except Exception as e:  # MemoryError included
+        # faster-whisper's VAD allocates the whole audio track as one array;
+        # a long video on a small box dies deep in numpy with
+        # "_ArrayMemoryError: Unable to allocate 114 MiB" (observed on a
+        # 25-min video after the Groq ASR path 413'd). That message helps no
+        # one. Name the real options instead.
+        name = type(e).__name__
+        if "MemoryError" in name or "ArrayMemory" in str(e) or "allocate" in str(e):
+            raise RuntimeError(
+                "Local Whisper ran out of memory on this video (the whole "
+                "audio track is decoded at once). Use a cloud backend "
+                "(TRANSCRIBE_BACKEND=groq with a key), a shorter video, or a "
+                "machine with more free RAM.") from e
+        raise
 
     out_segments = []
     text_parts = []
@@ -351,9 +378,11 @@ def _groq_transcribe_file(path, language=None):
     """POST one audio file to Groq; returns the verbose_json payload.
 
     Retries 429/5xx/transport errors with backoff — the free tier throttles
-    aggressively and 503s while models cold-load. Other statuses raise with
-    the response body (bad key, unsupported model) so the caller can fall
-    back instead of retrying forever.
+    aggressively and 503s while models cold-load. With a key pool
+    (GROQ_API_KEYS) a 429 rotates to the next key immediately instead of
+    sleeping, and only real 5xx/transport failures back off. Other statuses
+    raise with the response body (bad key, unsupported model) so the caller
+    can fall back instead of retrying forever.
     """
     import httpx
 
@@ -366,21 +395,48 @@ def _groq_transcribe_file(path, language=None):
     if language:
         data["language"] = language
 
+    # A key pool (GROQ_API_KEYS) multiplies the free tier: a 429 rides the next
+    # key straight away instead of backing off against the same exhausted one.
+    import groq_pool
+    pool = groq_pool.get_pool()
+    multi = len(pool) > 1
+
     last_err = None
-    for attempt in range(4):
-        if attempt:
+    rotated_prev = False
+    waited = 0  # per chunk, at most one window wait per key pool
+    for attempt in range(8):
+        if attempt and not rotated_prev:
             time.sleep(min(2 ** attempt * 2, 15))
+        rotated_prev = False
+        key = pool.pick() if multi else cfg["api_key"]
         try:
             with open(path, "rb") as f:
                 response = httpx.post(
                     f"{cfg['base_url']}/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                    headers={"Authorization": f"Bearer {key}"},
                     data=data,
                     files={"file": (os.path.basename(path), f, "audio/flac")},
                     timeout=httpx.Timeout(600.0, connect=30.0),
                 )
             if response.status_code == 200:
                 return response.json()
+            if response.status_code == 429 and multi:
+                pool.penalize(key)
+                recovery = pool.soonest_recovery()
+                if recovery is not None and waited < 1 and recovery <= 95:
+                    # Every key is benched AND rotation is exhausted: waiting
+                    # out one token window beats falling back to 15-minute
+                    # local whisper for the whole video.
+                    print(f"   ⏳ All Groq keys rate-limited — waiting "
+                          f"{recovery:.0f}s for the window to refill")
+                    time.sleep(recovery + 0.5)
+                    waited += 1
+                    rotated_prev = True  # the wait WAS the wait: no backoff too
+                    continue
+                rotated_prev = True
+                last_err = RuntimeError(
+                    f"groq HTTP 429 on {groq_pool._mask(key)} — rotating to next key")
+                continue
             if response.status_code == 429 or response.status_code >= 500:
                 last_err = RuntimeError(
                     f"groq HTTP {response.status_code}: {response.text[:200]}")
@@ -495,29 +551,96 @@ def _normalize_language(lang):
     return name_to_code.get(lang_lower, lang_lower[:2] if len(lang_lower) >= 2 else "en")
 
 
-def _probe_duration(path):
-    """Media/audio duration in seconds via ffprobe; 0.0 when unreadable."""
+def _ffprobe(args, path, timeout=120):
+    """Run ffprobe with these args and return its non-empty stdout lines."""
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=60,
+            ["ffprobe", "-v", "error", *args, str(path)],
+            capture_output=True, text=True, timeout=timeout,
         )
-        return float(out.stdout.strip() or 0.0)
     except Exception:
-        return 0.0
+        return []
+    return [line.strip() for line in (out.stdout or "").splitlines() if line.strip()]
+
+
+def _probe_pts_range(path):
+    """(first_packet_seconds, duration_seconds) read from the packet table.
+
+    A demux-only read (no decode), and the only measurement that works on the
+    FLAC parts the segment muxer writes: those carry no duration in their
+    header, so ``format=duration`` answers ``N/A``. The muxer also leaves the
+    timestamps stamped against the ORIGINAL media, which makes the first
+    packet's time the part's true offset in the file.
+    """
+    lines = _ffprobe(["-select_streams", "a:0", "-show_entries",
+                      "packet=pts_time,duration_time", "-of", "csv=p=0"], path)
+    if not lines:
+        return 0.0, 0.0
+
+    def _head(line):
+        # "60.022938,0.045437" -> (60.022938, 0.045437); N/A fields become 0.0.
+        values = []
+        for field in line.split(","):
+            try:
+                values.append(float(field))
+            except ValueError:
+                values.append(0.0)
+        return values
+
+    first = _head(lines[0])
+    last = _head(lines[-1])
+    start = first[0]
+    end = (last[0] + last[1]) if len(last) > 1 else last[0]
+    return start, max(0.0, end - start)
+
+
+def _probe_duration(path):
+    """Media/audio duration in seconds via ffprobe; 0.0 when unreadable.
+
+    Falls back to the packet table when the header has no duration — without
+    it, the muxer's FLAC parts measured 0.0 and every chunk offset silently
+    collapsed onto the start of the file (2-nov-2026: a 4-hour video came back
+    as 4 041 segments inside its first 9 minutes, which is what made the cuts
+    land mid-sentence and the captions read late on every later clip).
+    """
+    for entries in ("format=duration", "stream=duration"):
+        lines = _ffprobe(["-select_streams", "a:0", "-show_entries", entries,
+                          "-of", "csv=p=0"], path, timeout=60)
+        for line in lines:
+            try:
+                value = float(line)
+            except ValueError:
+                continue
+            if value > 0:
+                return value
+    return _probe_pts_range(path)[1]
 
 
 def _groq_part_plan(size_bytes, duration, max_bytes):
     """Seconds per upload part to stay under the cap, or None for one upload.
 
-    The 300s floor assumes 16kHz mono FLAC speech (~1 MB/min worst case) —
-    a cap that tight would mean the request itself is the problem.
+    Parts target 90% of the cap so a part can't land exactly on it. There is
+    deliberately NO floor: dense audio (game footage, music, several voices)
+    runs far above the ~1 MB/min speech figure, and a 300s floor on 12 MB/min
+    audio produces 58 MB parts — a guaranteed 413 (that killed cloud ASR on
+    the 1000-players Minecraft video, 17-oct-2026).
+
+    An unreadable duration with an over-cap file still has to be split:
+    returning ``None`` there used to hand the whole 4-hour FLAC to the API for
+    a 413, so a conservative slice is planned instead of giving up.
     """
-    if size_bytes <= max_bytes or duration <= 0:
+    if size_bytes <= max_bytes:
         return None
-    part_secs = int(max_bytes / (size_bytes / duration))
-    return max(min(part_secs, 3600), 300)
+    if duration <= 0:
+        return _UNKNOWN_DURATION_PART_SECS
+    per_sec = size_bytes / duration
+    part_secs = int((max_bytes * 0.9) / per_sec)
+    return max(30, part_secs)
+
+
+# Dense 16 kHz mono audio runs ~1 MB/min; 5 minutes stays under a 24 MB cap
+# even for material that compresses poorly.
+_UNKNOWN_DURATION_PART_SECS = 300
 
 
 def _extract_groq_audio(media_path, tmpdir):
@@ -535,9 +658,22 @@ def _extract_groq_audio(media_path, tmpdir):
 def _split_audio_for_groq(media_path, tmpdir, max_bytes):
     """Return [(part_path, offset_seconds)] covering the media's audio.
 
-    Offsets come from each part's actual probed duration, so a split landing
-    on a stream discontinuity can't drift the transcript. Parts are named
-    part_%05d.flac by the segment muxer.
+    Every offset is READ FROM THE PART (its first packet's timestamp), never
+    accumulated from probed durations. The segment muxer leaves each part's
+    timestamps stamped against the original media and writes no duration in
+    the header, so the old running-offset total added 0.0 to every chunk: all
+    23 parts of a 4-hour video were posted as if they each started at 0 s,
+    their segments piled up inside the first 9 minutes, and clip cuts and
+    karaoke captions inherited the drift (2-nov-2026).
+
+    Two layers keep every part under Groq's upload cap: the plan targets 90%
+    of the bytes, and anything that still overshoots — dense audio spikes far
+    above speech's ~1 MB/min — is re-cut by TIME until it fits (``-fs`` is
+    never used: a byte cap truncates mid-FLAC-frame and corrupts the file,
+    which is how the 2-nov resplit's own sub_ files came back unreadable).
+    Files are not deleted here: the caller's finally-block clears tmpdir, and
+    deleting something still in the return value is how the old code broke its
+    own parts (FileNotFoundError on its own sub_ files).
     """
     full_path = _extract_groq_audio(media_path, tmpdir)
     part_secs = _groq_part_plan(
@@ -552,14 +688,130 @@ def _split_audio_for_groq(media_path, tmpdir, max_bytes):
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         timeout=1800,
     )
-    parts = []
-    offset = 0.0
-    for name in sorted(os.listdir(tmpdir)):
-        if name.startswith("part_"):
-            path = os.path.join(tmpdir, name)
-            parts.append((path, offset))
-            offset += _probe_duration(path)
-    return parts or [(full_path, 0.0)]
+    names = sorted(name for name in os.listdir(tmpdir)
+                   if name.startswith("part_") and name.endswith(".flac"))
+    if not names:
+        return [(full_path, 0.0)]
+
+    fixed = []
+    for slot, name in enumerate(names):
+        path = os.path.join(tmpdir, name)
+        offset, duration = _probe_pts_range(path)
+        if duration <= 0:
+            continue  # no audio packets: a boundary artefact, not content
+        for part, part_offset in _fit_under_cap(
+                path, offset, duration, max_bytes, tmpdir, f"p{slot:05d}"):
+            fixed.append((part, part_offset))
+    if fixed:
+        return fixed
+
+    # Nothing measured — ffprobe could not read any part. Numbering them by the
+    # plan is approximate but monotonic, and that beats the old failure where
+    # every chunk landed on 0 s (2-nov-2026).
+    print("   ⚠️ [ASR] no chunk offsets readable; falling back to the planned "
+          f"{part_secs}s cadence for {len(names)} parts")
+    return [(os.path.join(tmpdir, name), slot * part_secs)
+            for slot, name in enumerate(names)]
+
+
+MAX_RESPLITS = 4
+
+
+def _fit_under_cap(path, offset, duration, max_bytes, tmpdir, tag, depth=0):
+    """[(path, absolute_offset)] for one part, halved until it fits the cap.
+
+    Each cut gets its own file prefix: a shared ``sub_%05d`` let every ffmpeg
+    invocation overwrite the previous part's sub files, so two oversized parts
+    collected the same (last-written) files and their offsets drifted — the
+    first form of the captions-don't-match bug (2-nov).
+
+    Sub-part offsets stay absolute whatever the muxer does with the clock: the
+    muxer normally keeps the parent's stamp, and a reset-to-zero sub file
+    (``offset < parent``) is re-based on the parent instead of trusted.
+    """
+    size = os.path.getsize(path)
+    if duration <= 0:
+        return []  # no audio packets: a boundary artefact, not content
+    if size <= max_bytes or depth >= MAX_RESPLITS or duration <= 1.0:
+        if size > max_bytes:
+            print(f"   ⚠️ [ASR] {os.path.basename(path)} still exceeds the upload "
+                  f"cap after {depth} re-splits ({size / 1e6:.1f} MB); dropping "
+                  "this slice — a gap beats a 413")
+            return []
+        return [(path, offset)]
+
+    sub_secs = max(1, int(duration * (max_bytes / size) * 0.9))
+    prefix = f"sub_{tag}_{depth}_"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+         "-f", "segment", "-segment_time", str(sub_secs), "-c:a", "flac",
+         os.path.join(tmpdir, prefix + "%05d.flac")],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        timeout=1800,
+    )
+    out = []
+    for sub_slot, name in enumerate(sorted(n for n in os.listdir(tmpdir)
+                                           if n.startswith(prefix) and n.endswith(".flac"))):
+        sub_path = os.path.join(tmpdir, name)
+        sub_offset, sub_duration = _probe_pts_range(sub_path)
+        if sub_offset < offset - 0.05:  # this muxer reset the clock
+            sub_offset += offset
+        out.extend(_fit_under_cap(sub_path, sub_offset, sub_duration, max_bytes,
+                                  tmpdir, f"{tag}_{sub_slot:03d}", depth + 1))
+    return out
+
+
+def _free_gb(path):
+    import shutil
+    try:
+        return shutil.disk_usage(path).free / 1024 ** 3
+    except OSError:
+        return -1.0
+
+
+def _asr_tmpdir(min_free_gb=2.0):
+    """Where ASR scratch lives (extraction + chunk splits) — the Groq path
+    ffmpeg-extracts a large FLAC here BEFORE the API is ever called.
+
+    The system temp default lives on a full OS drive: a 16 kHz mono FLAC of
+    a ~1 h video is 300–500 MB, and with C: at 232 MB every Groq job died
+    with ffmpeg exit -28 (ENOSPC) before reaching the API — the fallback
+    then OOM'd on local whisper (observed 1-nov-2026 on the 10,000-players
+    Minecraft video). ASR_TMPDIR wins when set; otherwise the candidate with
+    the most free space among the fixed drives. Falls back to the system
+    temp only when nothing else is writable.
+    """
+    explicit = (os.environ.get("ASR_TMPDIR") or "").strip()
+    if explicit:
+        # An explicitly configured path is honored unconditionally: the
+        # operator chose it, and second-guessing them with a free-space check
+        # is how a pinned volume gets silently ignored.
+        try:
+            os.makedirs(explicit, exist_ok=True)
+            if os.access(explicit, os.W_OK):
+                return explicit
+        except OSError:
+            pass
+    candidates = []
+    candidates.append(os.path.join(tempfile.gettempdir(), "openshorts_asr"))
+    for letter in ("E", "D", "C"):
+        candidates.append(f"{letter}:\\openshorts_asr")
+    best, best_free = None, -1.0
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            os.makedirs(cand, exist_ok=True)
+            if not os.access(cand, os.W_OK):
+                continue
+        except OSError:
+            continue
+        free = _free_gb(cand)
+        if free >= min_free_gb:
+            return cand
+        if free > best_free:
+            best, best_free = cand, free
+    return best or tempfile.mkdtemp(prefix="openshorts_asr_")
 
 
 def _transcribe_with_groq(media_path):
@@ -578,24 +830,25 @@ def _transcribe_with_groq(media_path):
             "GROQ_API_KEY is not set — TRANSCRIBE_BACKEND=groq needs it "
             "(console.groq.com, free tier works)")
 
-    tmpdir = tempfile.mkdtemp(prefix="groq_asr_")
+    tmpdir = tempfile.mkdtemp(prefix="groq_asr_", dir=_asr_tmpdir())
     try:
         parts = _split_audio_for_groq(
             media_path, tmpdir, cfg["max_upload_mb"] * 1024 * 1024)
-        progress = _TranscribeProgress(
-            sum(_probe_duration(p) for p, _ in parts))
+        # Progress against the source length, not the sum of the parts: the FLAC
+        # muxer copies the WHOLE file's sample count into each part's header, so
+        # adding the parts up multiplies the total, and the parts' headers are
+        # N/A anyway. Each part's offset is already "seconds of audio behind us".
+        progress = _TranscribeProgress(_probe_duration(media_path))
         segments = []
         text_parts = []
         language = None
-        done = 0.0
         for path, offset in parts:
+            progress.update(offset)
             payload = _groq_transcribe_file(path, language=language)
             language = language or _normalize_language(payload.get("language"))
             transcript = _groq_payload_to_transcript(payload, offset=offset)
             segments.extend(transcript["segments"])
             text_parts.append(transcript["text"])
-            done += _probe_duration(path)
-            progress.update(done)
         progress.update(progress.total)
         return {
             "text": " ".join(part for part in text_parts if part),

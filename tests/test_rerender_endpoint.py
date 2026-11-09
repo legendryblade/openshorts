@@ -337,6 +337,118 @@ class TestRerenderPersistence:
         assert "world" not in by_text
 
 
+class TestRecutCaptionVerdict:
+    """A recut re-burns captions, so it must re-judge them.
+
+    The pill the library shows is the verdict recorded at selection time, for a
+    range this render replaced. Inheriting it would have the UI certify text
+    nobody can watch — and a cut saved without captions would keep vouching for
+    the ones it removed.
+    """
+    STALE = {"ok": True, "issues": [], "stats": {"words": 999}, "clip": [10.0, 40.0]}
+
+    def _seed_stale(self, job):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["shorts"][0]["caption_review"] = self.STALE
+        job["meta_path"].write_text(json.dumps(meta))
+        app_module.jobs[JOB_ID]["result"]["clips"][0]["caption_review"] = self.STALE
+
+    def _rerender(self, segments, **extra):
+        body = {"job_id": JOB_ID, "clip_index": 0, "segments": segments}
+        body.update(extra)
+        resp = _request("POST", "/api/clip/rerender", body)
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_a_captioned_recut_ships_its_own_verdict(self, job, fake_recut):
+        self._seed_stale(job)
+        # 12→21s keeps "hello" and "world" and drops "again". The fixture
+        # transcript is spread over 60s, so pacing is deliberately thin here;
+        # this test owns which text was judged, not whether it read well.
+        data = self._rerender([{"start": 12, "end": 21}])
+        fresh = data["caption_review"]
+        assert fresh != self.STALE
+        # SOURCE seconds, like every other stored verdict — the burn is judged
+        # in clip-relative time, so this is where those two get reconciled.
+        assert fresh["clip"] == [12.0, 21.0]
+        assert fresh["stats"]["words"] == 2
+        assert set(fresh) == {"ok", "issues", "detail", "stats", "clip"}
+
+        stored = json.loads(job["meta_path"].read_text())["shorts"][0]
+        assert stored["caption_review"] == fresh
+        mem = app_module.jobs[JOB_ID]["result"]["clips"][0]
+        assert mem["caption_review"] == fresh
+
+    def test_a_cut_saved_without_captions_has_no_verdict(self, job, fake_recut):
+        self._seed_stale(job)
+        data = self._rerender([{"start": 12, "end": 20}],
+                              reapply_captions=False)
+        assert data["caption_review"] is None
+        stored = json.loads(job["meta_path"].read_text())["shorts"][0]
+        assert stored["caption_review"] is None
+
+    def test_a_suspect_recut_says_so(self, job, fake_recut):
+        # 90s of silence between words: 8s of clip carrying "again" alone is
+        # sparse speech, and the verdict the editor shows has to be the new one.
+        data = self._rerender([{"start": 50, "end": 58}])
+        assert "sparse_speech" in data["caption_review"]["issues"]
+        assert data["caption_review"]["detail"]
+
+    def test_an_audit_problem_never_costs_the_saved_cut(self, job, fake_recut,
+                                                       monkeypatch):
+        import caption_audit
+
+        def explode(*a, **kw):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(caption_audit, "audit", explode)
+        data = self._rerender([{"start": 12, "end": 20}])
+        assert data["success"] is True
+        assert data["recipe"]["segments"] == [{"start": 12.0, "end": 20.0}]
+        assert data["caption_review"] is None
+
+
+class TestStaleVerdictRejudge:
+    """The library must not accuse a clip of a problem the current rules clear.
+
+    Verdicts written before the karaoke pacing rule are still sitting in old
+    metadata, and nothing re-measures them unless the user edits the clip. The
+    read model re-judges them on the way out.
+    """
+    def _list(self):
+        resp = _request("GET", "/api/jobs")
+        assert resp.status_code == 200, resp.text
+        job = next(j for j in resp.json()["jobs"] if j["job_id"] == JOB_ID)
+        return job["clips"][0]
+
+    def test_a_pre_rule_verdict_is_re_measured(self, job):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["shorts"][0]["start"] = 12.0
+        meta["shorts"][0]["end"] = 21.0
+        # The old shape: no "clip" range, and a verdict nobody re-checked.
+        meta["shorts"][0]["caption_review"] = {
+            "ok": False, "issues": ["too_fast_to_read"],
+            "stats": {"words": 2}}
+        job["meta_path"].write_text(json.dumps(meta))
+
+        clip = self._list()
+        assert clip["caption_review"]["clip"] == [12.0, 21.0]
+        assert "too_fast_to_read" not in clip["caption_review"]["issues"]
+
+    def test_a_current_verdict_is_served_as_recorded(self, job):
+        meta = json.loads(job["meta_path"].read_text())
+        recorded = {"ok": False, "issues": ["gibberish"], "detail": ["x"],
+                    "stats": {"words": 3}, "clip": [12.0, 21.0]}
+        meta["shorts"][0]["caption_review"] = recorded
+        job["meta_path"].write_text(json.dumps(meta))
+        assert self._list()["caption_review"] == recorded
+
+    def test_a_clip_with_no_verdict_stays_silent(self, job):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["shorts"][0]["caption_review"] = None
+        job["meta_path"].write_text(json.dumps(meta))
+        assert self._list()["caption_review"] is None
+
+
 class TestMcpTool:
     def test_recut_clip_is_registered(self):
         import mcp_server

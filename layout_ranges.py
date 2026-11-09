@@ -66,6 +66,19 @@ def normalise(ranges):
     return out
 
 
+def first_layout(ranges, default="auto"):
+    """The layout of the first range, whatever shape the rows are in.
+
+    The critique gate needs ONE layout name for the whole clip. Callers used
+    to index ``ranges[0][2]`` directly, which raised KeyError: 2 the moment
+    rows became dicts — every clip died right after captions burned
+    (17-oct-2026). Dict rows, legacy tuples and junk all land on a name.
+    """
+    for r in normalise(ranges):
+        return r["layout"] or default
+    return default
+
+
 def split_ranges(ranges):
     """(start, end) pairs of the stretches where captions belong on the seam."""
     return [(r["start"], r["end"]) for r in normalise(ranges) if r["layout"] == "split"]

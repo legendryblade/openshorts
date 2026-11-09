@@ -7,10 +7,11 @@ the contract being tested: self-host must serve MCP without any of that.
 """
 import asyncio
 
+import httpx
+import pytest
+
 # Self-host mode is guaranteed by tests/conftest.py (BILLING_ENABLED=0), which
 # runs before any test module can import app.
-import httpx
-
 import app as app_module
 from app import app
 
@@ -104,6 +105,10 @@ class TestCloudModeAuth:
 
     def test_401_without_credentials(self, monkeypatch):
         monkeypatch.setenv("BILLING_ENABLED", "1")
+        # cloud.auth needs the billing stack (jwt, sqlalchemy) — only
+        # requirements-billing.txt installs them. Self-host runs can't.
+        pytest.importorskip("jwt")
+        pytest.importorskip("sqlalchemy")
         resp = _post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         assert resp.status_code == 401
         # OAuth-capable clients discover the login flow from this header.
@@ -113,6 +118,8 @@ class TestCloudModeAuth:
 
     def test_resolvable_user_passes(self, monkeypatch):
         monkeypatch.setenv("BILLING_ENABLED", "1")
+        pytest.importorskip("jwt")
+        pytest.importorskip("sqlalchemy")
         import cloud.auth as cloud_auth
 
         async def fake_user(request):

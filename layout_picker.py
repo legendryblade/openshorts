@@ -74,7 +74,11 @@ DECISION_FLAGS = {
     "none": [],
     "screencast": ["screencast_layout"],
     "split": ["split_layout", "active_speaker"],
-    "gaming_split": ["gaming_split_layout", "facecam_extractor"],
+    # The gaming_split render path is camera_inset/reframe_v2 driven off
+    # DECISION itself, so the only module apply() switches on is the facecam
+    # detector. (A "gaming_split_layout" flag used to sit here mapping to no
+    # module at all — dead flag, removed.)
+    "gaming_split": ["facecam_extractor"],
 }
 
 VALID = set(DECISION_FLAGS)

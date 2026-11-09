@@ -5,6 +5,8 @@ bytes) -> per-GB paid proxy (720p cost cap) -> conservative fallback. The
 ``capped`` flag marks the attempts whose bytes are billed per GB (drives the
 720p format cap and the PROXY_BYTES monthly counter).
 """
+import os
+
 import pytest
 
 main = pytest.importorskip("main")
@@ -70,3 +72,45 @@ def test_direct_file_urls_skip_the_proxy_chain():
     assert main.is_youtube_url("https://youtu.be/x")
     assert not main.is_youtube_url("https://litter.catbox.moe/u90j4q.mp4")
     assert not main.is_youtube_url("https://tmpfiles.org/dl/1/2/v.mp4")
+
+
+class TestCookieResolution:
+    """YOUTUBE_COOKIES is the one durable fix for the "Sign in to confirm
+    you're not a bot" wall. It used to accept only pasted Netscape content and
+    wrote it to /app/cookies.txt — a path that exists only inside the Docker
+    image, so every self-hosted box silently downloaded with NO cookies (the
+    Windows write failed and the path became None)."""
+
+    def test_path_form_is_used_as_is(self, tmp_path, monkeypatch):
+        f = tmp_path / "cookies.txt"
+        f.write_text("# Netscape HTTP Cookie File\n")
+        monkeypatch.setenv("YOUTUBE_COOKIES", str(f))
+        path, msg = main.resolve_youtube_cookies()
+        assert path == str(f)
+        assert "Using cookies file" in msg
+
+    def test_pasted_content_lands_in_a_writable_dir(self, tmp_path, monkeypatch):
+        blob = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tsid\tx\n"
+        monkeypatch.setenv("YOUTUBE_COOKIES", blob)
+        # tempfile caches its dir on first use; pin the cache so the test is
+        # order-independent.
+        import tempfile
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        path, msg = main.resolve_youtube_cookies()
+        assert path and os.path.isfile(path)
+        assert open(path, encoding="utf-8").read() == blob
+        assert "Wrote YOUTUBE_COOKIES content" in msg
+        assert "sid" not in msg, "status must never echo live session cookies"
+
+    def test_unset_means_no_cookies_and_a_clear_warning(self, monkeypatch):
+        monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+        path, msg = main.resolve_youtube_cookies()
+        assert path is None
+        assert "not found" in msg
+
+    def test_no_container_path_leaks_into_the_result(self, monkeypatch):
+        # The old code wrote to /app/cookies.txt; on Windows that write fails
+        # and cookies silently vanish. The temp-dir location must win.
+        monkeypatch.setenv("YOUTUBE_COOKIES", "# Netscape HTTP Cookie File\n")
+        path, _ = main.resolve_youtube_cookies()
+        assert path is None or "/app/" not in path

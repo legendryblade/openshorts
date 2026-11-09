@@ -5,141 +5,1078 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OpenShorts — Video to Shorts</title>
 <style>
+/* ── Design tokens ───────────────────────────────────────────────
+   A studio-edit surface: warm near-black, one signal accent used for
+   the primary action and live state only. Mono is reserved for the
+   pipeline log — the one place that is machine output. */
+:root{
+  --bg:#0c0c0e; --surface:#151518; --surface-2:#1b1b1f; --line:#26262b;
+  --line-strong:#34343a; --text:#ededf0; --text-2:#a2a2ab; --text-3:#6a6a73;
+  --accent:#ff5a36; --accent-hi:#ff7a5c; --accent-dim:rgba(255,90,54,.14);
+  --ok:#3dd68c; --err:#ff616b; --info:#6cb6ff;
+  --radius:14px; --radius-sm:10px;
+  --mono:'Cascadia Code','SF Mono',ui-monospace,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif;
+  --sidebar:248px;
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0a0c;color:#e4e4e7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh}
-nav{padding:16px 32px;border-bottom:1px solid #27272a;display:flex;justify-content:space-between;align-items:center}
-nav strong{font-size:18px;color:#8b5cf6}
-.container{max-width:720px;margin:0 auto;padding:32px 20px}
-h1{font-size:26px;text-align:center;margin-bottom:8px}
-.sub{text-align:center;color:#71717a;font-size:14px;margin-bottom:28px}
-.card{background:#18181b;border:1px solid #27272a;border-radius:16px;padding:24px;margin-bottom:20px}
-label{display:block;font-size:13px;color:#a1a1aa;margin-bottom:8px;font-weight:600}
-input[type=text],input[type=number]{width:100%;background:#0a0a0c;border:1px solid #3f3f46;border-radius:10px;padding:12px 14px;color:#e4e4e7;font-size:15px;outline:none}
-input:focus{border-color:#8b5cf6}
-.row{display:flex;gap:12px;margin-top:16px}
-.row>div{flex:1}
-select{width:100%;background:#0a0a0c;border:1px solid #3f3f46;border-radius:10px;padding:12px;color:#e4e4e7;font-size:15px}
-.btn{width:100%;background:#8b5cf6;color:#fff;border:none;border-radius:12px;padding:14px;font-size:16px;font-weight:700;cursor:pointer;margin-top:20px;transition:background .2s}
-.btn:hover{background:#7c3aed}
-.btn:disabled{background:#3f3f46;cursor:not-allowed}
-.btn-secondary{background:#27272a;color:#e4e4e7;margin-top:10px}
-.btn-secondary:hover{background:#3f3f46}
-#status{display:none;margin-top:20px}
-#statusLog{background:#0a0a0c;border:1px solid #27272a;border-radius:10px;padding:14px;max-height:300px;overflow-y:auto;font-family:'Cascadia Code',monospace;font-size:12px;color:#a1a1aa;white-space:pre-wrap;word-wrap:break-word}
-.statusBadge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600;margin-bottom:10px}
-.status-queued{background:#3f3f46;color:#a1a1aa}
-.status-processing{background:#1e3a5f;color:#60a5fa;animation:pulse 1.5s infinite}
-.status-done{background:#14532d;color:#4ade80}
-.status-error{background:#7f1d1d;color:#f87171}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
-#clips{display:none}
-.clipCard{background:#18181b;border:1px solid #27272a;border-radius:14px;padding:16px;margin-top:14px;display:flex;gap:14px;align-items:center}
-.clipCard video{width:120px;border-radius:8px;flex-shrink:0}
-.clipInfo{flex:1;min-width:0}
-.clipTitle{font-size:14px;font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.clipMeta{font-size:12px;color:#71717a}
-.clipBtn{background:#8b5cf6;color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;text-decoration:none;display:inline-block;margin-top:6px}
-.clipBtn:hover{background:#7c3aed}
-.downloadAll{margin-top:16px}
-.error{background:#7f1d1d;color:#f87171;padding:12px;border-radius:10px;margin-top:12px;font-size:14px}
+html{color-scheme:dark}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);
+     min-height:100vh;font-size:15px;line-height:1.45;
+     -webkit-font-smoothing:antialiased}
+button{font-family:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+
+/* ── App shell ── */
+.app{display:grid;grid-template-columns:var(--sidebar) 1fr;min-height:100vh}
+aside{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;
+  background:var(--surface);border-right:1px solid var(--line);padding:18px 14px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;
+  letter-spacing:-.01em;padding:0 8px 4px}
+.brand .dot{width:11px;height:11px;border-radius:3px;background:var(--accent);
+  box-shadow:0 0 12px rgba(255,90,54,.6);position:relative;flex-shrink:0}
+.brand .dot::after{content:'';position:absolute;left:3.5px;top:3px;width:0;height:0;
+  border-left:5px solid var(--surface);border-top:3.5px solid transparent;
+  border-bottom:3.5px solid transparent}
+.brand-sub{font-size:11.5px;color:var(--text-3);padding:0 8px 18px}
+nav{display:flex;flex-direction:column;gap:3px}
+.nav-item{display:flex;align-items:center;gap:10px;width:100%;background:none;
+  border:none;color:var(--text-2);text-align:left;font-size:13.5px;font-weight:600;
+  padding:9px 10px;border-radius:9px;cursor:pointer;transition:all .12s}
+.nav-item:hover{background:var(--surface-2);color:var(--text)}
+.nav-item.active{background:var(--accent-dim);color:var(--accent-hi)}
+.nav-item .ico{font-size:15px;width:20px;text-align:center;flex-shrink:0}
+.nav-item .badge-count{margin-left:auto;font-size:11px;font-family:var(--mono);
+  color:var(--text-3);background:var(--surface-2);border-radius:99px;padding:1px 7px}
+aside .spacer{flex:1}
+.engine{border:1px solid var(--line);border-radius:10px;padding:10px;
+  font-size:11.5px;color:var(--text-2)}
+.engine .row{display:flex;align-items:center;gap:7px;margin-bottom:4px}
+.engine .pip{width:7px;height:7px;border-radius:50%;background:var(--ok);
+  box-shadow:0 0 8px rgba(61,214,140,.7)}
+.engine .pip.down{background:var(--err);box-shadow:0 0 8px rgba(255,97,107,.7)}
+.engine .row b{color:var(--text);font-size:12px}
+.engine .model{font-family:var(--mono);font-size:10.5px;color:var(--text-3);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.main{min-width:0;display:flex;flex-direction:column}
+.topbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;
+  padding:13px 28px;background:rgba(12,12,14,.85);backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line)}
+.topbar h1{font-size:16px;font-weight:700;letter-spacing:-.01em}
+.topbar .sub{font-size:12.5px;color:var(--text-3)}
+.topbar .spacer{flex:1}
+.view{display:none;padding:26px 28px 90px;max-width:980px;width:100%}
+.view.active{display:block}
+.lede h2{font-size:24px;font-weight:700;letter-spacing:-.02em;margin-bottom:5px}
+.lede p{color:var(--text-2);font-size:14px;max-width:62ch}
+
+.card{background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius);padding:20px;margin-top:20px}
+.card h3{font-size:12px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--text-3);margin-bottom:14px}
+
+/* ── Form controls ── */
+.field{margin-bottom:16px}
+.field>label{display:block;font-size:12.5px;font-weight:600;color:var(--text-2);
+  margin-bottom:7px}
+input[type=text],input[type=number],input[type=password],select{
+  width:100%;background:var(--bg);border:1px solid var(--line-strong);
+  border-radius:var(--radius-sm);padding:11px 13px;color:var(--text);
+  font-size:14.5px;font-family:inherit;transition:border-color .15s}
+input::placeholder{color:var(--text-3)}
+input:hover,select:hover{border-color:#42424a}
+input:focus,select:focus{border-color:var(--accent);outline:none;
+  box-shadow:0 0 0 3px var(--accent-dim)}
+select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a2a2ab' fill='none' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 13px center;padding-right:34px}
+
+.divider{display:flex;align-items:center;gap:12px;color:var(--text-3);
+  font-size:12px;margin:4px 0 14px}
+.divider::before,.divider::after{content:'';flex:1;height:1px;background:var(--line)}
+
+.dropzone{border:1.5px dashed var(--line-strong);border-radius:var(--radius-sm);
+  padding:22px 16px;text-align:center;cursor:pointer;transition:all .15s;
+  color:var(--text-2)}
+.dropzone:hover{border-color:var(--accent);color:var(--text)}
+.dropzone.drag{border-color:var(--accent);background:var(--accent-dim);
+  color:var(--text)}
+.dropzone .dz-title{font-size:14px;font-weight:600;margin-bottom:3px}
+.dropzone .dz-sub{font-size:12.5px;color:var(--text-3)}
+.dropzone.has-file{border-style:solid;border-color:var(--ok);
+  background:rgba(61,214,140,.07)}
+.dropzone.has-file .dz-title{color:var(--ok)}
+.dropzone input[type=file]{display:none}
+
+.controls{display:grid;grid-template-columns:1fr auto;gap:16px;
+  align-items:end;margin-bottom:6px}
+.seg{display:flex;background:var(--bg);border:1px solid var(--line-strong);
+  border-radius:var(--radius-sm);padding:3px;gap:3px}
+.seg button{flex:1;border:none;background:transparent;color:var(--text-2);
+  font-size:13px;font-weight:600;padding:8px 10px;border-radius:7px;
+  cursor:pointer;transition:all .15s;white-space:nowrap}
+.seg button:hover{color:var(--text)}
+.seg button[aria-pressed=true]{background:var(--accent);color:#140a06}
+.stepper{display:flex;align-items:center;background:var(--bg);
+  border:1px solid var(--line-strong);border-radius:var(--radius-sm);overflow:hidden}
+.stepper button{width:38px;height:41px;border:none;background:transparent;
+  color:var(--text-2);font-size:19px;cursor:pointer;transition:all .12s}
+.stepper button:hover{background:var(--surface-2);color:var(--text)}
+.stepper button:disabled{opacity:.35;cursor:not-allowed}
+.stepper input{width:44px;border:none;border-radius:0;text-align:center;
+  padding:11px 0;font-weight:700;font-variant-numeric:tabular-nums;
+  background:transparent}
+.stepper input:focus{box-shadow:none}
+
+.btn{width:100%;background:var(--accent);color:#170a05;border:none;
+  border-radius:var(--radius-sm);padding:13px;font-size:15px;font-weight:700;
+  cursor:pointer;margin-top:18px;transition:background .15s,transform .05s;
+  letter-spacing:-.01em}
+.btn:hover{background:var(--accent-hi)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{background:var(--surface-2);color:var(--text-3);cursor:not-allowed;
+  transform:none}
+.btn-ghost{background:var(--surface-2);color:var(--text);
+  border:1px solid var(--line-strong)}
+.btn-ghost:hover{background:#232328;border-color:#42424a}
+.btn-inline{width:auto;margin-top:0;padding:8px 15px;font-size:13px}
+
+.error{display:flex;gap:9px;align-items:flex-start;background:rgba(255,97,107,.09);
+  border:1px solid rgba(255,97,107,.35);color:#ffb3b8;padding:12px 14px;
+  border-radius:var(--radius-sm);margin-top:14px;font-size:13.5px}
+.error::before{content:'⚠';flex-shrink:0}
+
+/* ── Run panel ── */
+.run-head{display:flex;align-items:center;gap:10px;margin-bottom:12px;
+  flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;
+  border-radius:99px;font-size:12.5px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.05em;border:1px solid}
+.badge .pip{width:7px;height:7px;border-radius:50%;background:currentColor}
+.badge-processing{color:var(--info);border-color:rgba(108,182,255,.4);
+  background:rgba(108,182,255,.1)}
+.badge-processing .pip{animation:pulse 1.1s infinite}
+.badge-queued{color:var(--text-2);border-color:var(--line-strong);
+  background:var(--surface-2)}
+.badge-done{color:var(--ok);border-color:rgba(61,214,140,.4);
+  background:rgba(61,214,140,.1)}
+.badge-error{color:var(--err);border-color:rgba(255,97,107,.4);
+  background:rgba(255,97,107,.1)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.elapsed{font-family:var(--mono);font-size:12.5px;color:var(--text-3);
+  font-variant-numeric:tabular-nums}
+.run-head .spacer{flex:1}
+
+.logwrap{position:relative;border-radius:var(--radius-sm);
+  border:1px solid var(--line);background:#0a0a0c;overflow:hidden}
+.logwrap::before{content:'';position:absolute;inset:0 0 auto 0;height:26px;
+  background:linear-gradient(#0a0a0c,transparent);pointer-events:none;z-index:1}
+#statusLog{padding:14px;max-height:300px;overflow-y:auto;
+  font-family:var(--mono);font-size:12px;line-height:1.65;color:var(--text-2);
+  white-space:pre-wrap;word-wrap:break-word;tab-size:2}
+
+/* ── Clips ── */
+.clips-head{display:flex;align-items:baseline;gap:10px;margin:26px 0 2px}
+.clips-head h2{font-size:19px;font-weight:700;letter-spacing:-.01em}
+.clips-head .count{font-size:13px;color:var(--text-3)}
+.clipCard{display:flex;gap:15px;background:var(--surface);
+  border:1px solid var(--line);border-radius:var(--radius);padding:14px;
+  margin-top:12px;animation:rise .35s ease both}
+.clipCard:nth-child(2){animation-delay:.05s}
+.clipCard:nth-child(3){animation-delay:.1s}
+.clipCard:nth-child(4){animation-delay:.15s}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.clipCard video{width:92px;aspect-ratio:9/16;object-fit:cover;border-radius:9px;
+  flex-shrink:0;background:#000;border:1px solid var(--line)}
+.clipInfo{flex:1;min-width:0;display:flex;flex-direction:column}
+.clipTop{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+.clipIdx{font-family:var(--mono);font-size:11px;color:var(--text-3);
+  border:1px solid var(--line);border-radius:6px;padding:1px 6px;flex-shrink:0}
+.clipTitle{font-size:14.5px;font-weight:650;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.score{font-size:11.5px;font-weight:700;font-variant-numeric:tabular-nums;
+  padding:2px 8px;border-radius:99px;flex-shrink:0;margin-left:auto}
+.score-hi{background:var(--accent-dim);color:var(--accent-hi)}
+.score-mid{background:var(--surface-2);color:var(--text-2)}
+.score-low{background:var(--surface-2);color:var(--text-3)}
+.clipHook{font-size:12.5px;color:var(--text-2);margin-bottom:9px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+  overflow:hidden}
+.clipBtn{align-self:flex-start;background:var(--surface-2);color:var(--text);
+  border:1px solid var(--line-strong);border-radius:8px;padding:7px 14px;
+  font-size:12.5px;font-weight:600;cursor:pointer;text-decoration:none;
+  transition:all .15s;margin-top:auto}
+.clipBtn:hover{border-color:var(--accent);color:var(--accent-hi)}
+.empty{color:var(--text-3);font-size:13.5px;padding:26px 4px;text-align:center}
+.empty .big{font-size:30px;margin-bottom:8px}
+
+/* ── Library ── */
+.jobCard{background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--radius);padding:18px;margin-top:14px}
+.jobHead{display:flex;align-items:baseline;gap:10px;margin-bottom:4px;
+  flex-wrap:wrap}
+.jobHead .jt{font-size:15.5px;font-weight:700;letter-spacing:-.01em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52ch}
+.jobHead .jm{font-size:12px;color:var(--text-3);font-family:var(--mono)}
+.jobHead .spacer{flex:1}
+.jobZip{background:var(--surface-2);color:var(--text);border:1px solid var(--line-strong);
+  border-radius:8px;padding:6px 13px;font-size:12.5px;font-weight:600;cursor:pointer}
+.jobZip:hover{border-color:var(--accent);color:var(--accent-hi)}
+.skeleton{height:88px;border-radius:var(--radius);margin-top:14px;
+  background:linear-gradient(90deg,var(--surface) 25%,var(--surface-2) 50%,
+  var(--surface) 75%);background-size:200% 100%;animation:shimmer 1.4s infinite}
+@keyframes shimmer{to{background-position:-200% 0}}
+
+/* ── Settings ── */
+.cfg-toggle{display:flex;justify-content:space-between;align-items:center;
+  width:100%;background:none;border:none;color:var(--text-2);font-size:12px;
+  font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+  cursor:pointer;padding:2px 0}
+.cfg-toggle:hover{color:var(--text)}
+.cfg-toggle .chev{font-family:var(--mono);font-weight:400;font-size:14px;
+  transition:transform .2s}
+.cfg-toggle[aria-expanded=true] .chev{transform:rotate(90deg)}
+.cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}
+.cfg-grid .full{grid-column:1/-1}
+.cfg-note{font-size:11.5px;color:var(--text-3);margin-top:5px}
+.cfg-status{font-size:12.5px;margin-top:10px;min-height:16px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px}
+.kv dt{color:var(--text-3)}
+.kv dd{color:var(--text);font-family:var(--mono);font-size:12.5px;
+  overflow:hidden;text-overflow:ellipsis}
+
+/* ── Caption template preview ── */
+.tpl-preview{display:flex;gap:6px;justify-content:center;align-items:baseline;
+  background:#0a0a0c;border:1px solid var(--line);border-radius:var(--radius-sm);
+  padding:18px 12px;margin:10px 0 6px;
+  font-family:Anton,'Anton-Regular',Impact,'Arial Black',sans-serif;
+  text-transform:uppercase;letter-spacing:.02em;min-height:64px;
+  background-image:linear-gradient(160deg,#151518 0%,#0a0a0c 60%,#101014 100%)}
+.tpl-word{font-size:30px;line-height:1;-webkit-text-stroke:3px #000;
+  paint-order:stroke fill;color:var(--tpl-color,#fff);opacity:var(--tpl-opacity,1)}
+.tpl-active{font-size:34px;color:var(--tpl-hi,#FFE500);
+  text-shadow:0 0 14px var(--tpl-glow,transparent)}
+
+/* ── Toasts ── */
+#toasts{position:fixed;right:18px;bottom:18px;z-index:100;display:flex;
+  flex-direction:column;gap:8px;max-width:min(360px,calc(100vw - 36px))}
+.toast{display:flex;gap:9px;align-items:flex-start;background:var(--surface-2);
+  border:1px solid var(--line-strong);border-radius:10px;padding:11px 14px;
+  font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.5);animation:toastIn .25s ease}
+.toast.ok{border-color:rgba(61,214,140,.4)}
+.toast.err{border-color:rgba(255,97,107,.4)}
+.toast .ico{flex-shrink:0}
+@keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+/* ── Motion layer ────────────────────────────────────────────────
+   Animation exists to explain state: views arrive, work-in-progress
+   is visible, results land. Everything is disabled wholesale under
+   prefers-reduced-motion. */
+@keyframes viewIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes cardIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes panelIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+@keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(400%)}}
+@keyframes popIn{0%{transform:scale(.4)}70%{transform:scale(1.25)}100%{transform:scale(1)}}
+
+.view.active{animation:viewIn .28s ease both}
+.view.active .card{animation:cardIn .32s ease both}
+.view.active .card:nth-child(2){animation-delay:.05s}
+.view.active .card:nth-child(3){animation-delay:.1s}
+.view.active .card:nth-child(4){animation-delay:.15s}
+#jobList .jobCard{animation:cardIn .3s ease both}
+#jobList .jobCard:nth-child(2){animation-delay:.06s}
+#jobList .jobCard:nth-child(3){animation-delay:.12s}
+#jobList .jobCard:nth-child(4){animation-delay:.18s}
+#configPanel:not(.hidden){animation:panelIn .2s ease both}
+.empty .big{display:inline-block;animation:floaty 3s ease-in-out infinite}
+
+/* Indeterminate top progress line: visible only while a job runs. */
+.topline{position:absolute;left:0;right:0;bottom:-1px;height:2px;overflow:hidden;
+  opacity:0;transition:opacity .3s}
+.topline.run{opacity:1}
+.topline .bar{height:100%;width:22%;background:linear-gradient(90deg,
+  transparent,var(--accent),transparent);animation:sweep 1.15s linear infinite}
+.topline.done{opacity:1}
+.topline.done .bar{width:100%;background:var(--ok);animation:none}
+.topline.error{opacity:1}
+.topline.error .bar{width:100%;background:var(--err);animation:none}
+
+/* Micro-interactions */
+.btn:hover:not(:disabled){box-shadow:0 0 24px rgba(255,90,54,.25)}
+.dropzone:hover{transform:translateY(-1px)}
+.dropzone.drag{transform:scale(1.01)}
+.clipCard{transition:border-color .15s,transform .15s}
+.clipCard:hover{border-color:var(--line-strong);transform:translateY(-1px)}
+.jobCard{transition:border-color .15s}
+.jobCard:hover{border-color:var(--line-strong)}
+.nav-item{transition:all .15s}
+.toast .ico{animation:popIn .3s ease both}
+.badge{transition:all .2s}
+
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+  }
+}
+
+@media (max-width:860px){
+  .app{grid-template-columns:1fr}
+  aside{position:static;height:auto;flex-direction:row;flex-wrap:wrap;
+    align-items:center;gap:8px;padding:10px 14px;border-right:none;
+    border-bottom:1px solid var(--line)}
+  .brand-sub,aside .spacer,.engine{display:none}
+  nav{flex-direction:row;margin-left:auto}
+  .nav-item{padding:7px 10px}
+  .nav-item .badge-count{display:none}
+  .view{padding:20px 16px 70px}
+  .topbar{padding:11px 16px}
+  .controls{grid-template-columns:1fr}
+  .cfg-grid{grid-template-columns:1fr}
+}
+/* ── Clip editor ─────────────────────────────────────────────────
+   A modal work surface, not another page: the clip stays visible
+   while you edit it, because every one of these controls is judged
+   by watching the result. */
+.editor{position:fixed;inset:0;z-index:60;background:rgba(8,8,10,.94);
+  display:flex;flex-direction:column;animation:edIn .2s ease}
+@keyframes edIn{from{opacity:0;transform:scale(.995)}to{opacity:1;transform:none}}
+.edHead{display:flex;align-items:center;gap:12px;padding:12px 20px;
+  border-bottom:1px solid var(--line);background:var(--surface);flex-shrink:0}
+.edHead .et{font-size:15px;font-weight:700;letter-spacing:-.01em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:46ch}
+.edHead .em{font-family:var(--mono);font-size:11.5px;color:var(--text-3)}
+.edHead .spacer{flex:1}
+.edClose{background:var(--surface-2);border:1px solid var(--line-strong);
+  color:var(--text-2);border-radius:8px;width:32px;height:32px;font-size:16px;
+  cursor:pointer;flex-shrink:0}
+.edClose:hover{color:var(--text);border-color:var(--accent)}
+.edBody{flex:1;min-height:0;display:grid;grid-template-columns:300px 1fr;
+  gap:0}
+.edSide{border-right:1px solid var(--line);padding:16px;overflow-y:auto;
+  background:var(--surface);display:flex;flex-direction:column;gap:12px}
+.edSide video{width:100%;aspect-ratio:9/16;border-radius:10px;background:#000;
+  border:1px solid var(--line);max-height:56vh;object-fit:contain}
+.edMain{min-width:0;display:flex;flex-direction:column}
+.edTabs{display:flex;gap:2px;padding:10px 18px 0;border-bottom:1px solid var(--line)}
+.edTab{background:none;border:none;border-bottom:2px solid transparent;
+  color:var(--text-3);font-size:13px;font-weight:700;padding:9px 14px;
+  cursor:pointer;letter-spacing:-.005em}
+.edTab:hover{color:var(--text-2)}
+.edTab[aria-selected=true]{color:var(--accent-hi);border-bottom-color:var(--accent)}
+.edTab .dot{display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:var(--accent);margin-left:6px;vertical-align:middle}
+.edPanel{flex:1;min-height:0;overflow-y:auto;padding:18px 20px 40px}
+.edPanel.hidden{display:none}
+.edRow{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:14px}
+.edRow .field{margin:0;min-width:130px;flex:1}
+.edRow .field.wide{flex:2 1 320px}
+.edHint{font-size:12px;color:var(--text-3);margin-top:-6px;margin-bottom:14px}
+.edBtns{display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+  border-top:1px solid var(--line);padding-top:14px;margin-top:6px}
+.edBtns .btn{width:auto;margin:0;padding:10px 18px;font-size:13.5px}
+.edStatus{font-size:12.5px;color:var(--text-3);font-family:var(--mono)}
+
+/* Timeline */
+.tl{border:1px solid var(--line);border-radius:10px;background:#0a0a0c;
+  padding:10px 12px 12px;user-select:none;touch-action:none}
+.tlTop{display:flex;align-items:center;gap:10px;font-family:var(--mono);
+  font-size:11px;color:var(--text-3);margin-bottom:8px}
+.tlTop b{color:var(--text);font-weight:600}
+.tlTrack{position:relative;height:96px;border-radius:8px;background:#101013;
+  border:1px solid var(--line);overflow:hidden;cursor:crosshair}
+.tlWords{position:absolute;inset:0 0 34px 0;pointer-events:none}
+.tlWord{position:absolute;top:6px;width:2px;height:14px;
+  background:rgba(162,162,171,.4);border-radius:1px}
+.tlWord.sil{height:6px;top:14px;background:rgba(106,106,115,.22)}
+.tlRuler{position:absolute;left:0;right:0;bottom:0;height:32px;
+  border-top:1px solid var(--line)}
+.tlTick{position:absolute;bottom:0;font-size:9.5px;color:var(--text-3);
+  border-left:1px solid var(--line);height:100%;padding:3px 0 0 4px;
+  font-family:var(--mono);white-space:nowrap}
+.tlSeg{position:absolute;top:4px;bottom:36px;background:rgba(255,90,54,.16);
+  border:1px solid var(--accent);border-radius:6px;cursor:grab;
+  display:flex;align-items:center;justify-content:center;overflow:hidden}
+.tlSeg.sel{background:rgba(255,90,54,.26);box-shadow:0 0 0 1px var(--accent)}
+.tlSeg span{font-family:var(--mono);font-size:10px;color:#ffd9cf;
+  pointer-events:none}
+.tlSeg.dragging{cursor:grabbing}
+.tlH{position:absolute;top:0;bottom:0;width:11px;cursor:ew-resize;flex-shrink:0}
+.tlH.l{left:-5px}.tlH.r{right:-5px}
+.tlH::after{content:'';position:absolute;top:25%;bottom:25%;left:4px;width:3px;
+  border-radius:2px;background:var(--accent)}
+.tlPlay{position:absolute;top:0;bottom:0;width:2px;background:var(--info);
+  pointer-events:none;box-shadow:0 0 8px rgba(108,182,255,.8)}
+.tlTools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.tlChip{display:inline-flex;align-items:center;gap:7px;background:var(--surface-2);
+  border:1px solid var(--line-strong);border-radius:99px;padding:5px 12px;
+  font-size:12px;color:var(--text-2);cursor:pointer}
+.tlChip:hover{color:var(--text);border-color:#42424a}
+.tlChip[aria-pressed=true]{background:var(--accent-dim);color:var(--accent-hi);
+  border-color:rgba(255,90,54,.4)}
+
+/* Caption blocks */
+.capBlock{display:flex;gap:8px;align-items:flex-start;border:1px solid var(--line);
+  border-radius:10px;padding:8px 10px;margin-bottom:8px;background:var(--surface)}
+.capBlock .t{font-family:var(--mono);font-size:10.5px;color:var(--text-3);
+  width:74px;flex-shrink:0;padding-top:7px}
+.capWords{display:flex;flex-wrap:wrap;gap:5px;flex:1}
+.capWord{background:var(--bg);border:1px solid var(--line);border-radius:6px;
+  color:var(--text);font-size:13px;padding:4px 7px;font-family:inherit;
+  min-width:26px;max-width:160px}
+.capWord:hover{border-color:var(--line-strong)}
+.capWord:focus{border-color:var(--accent);outline:none}
+.capDel{background:none;border:none;color:var(--text-3);cursor:pointer;
+  font-size:14px;line-height:1;padding:4px}
+.capDel:hover{color:var(--err)}
+.capAdd{background:var(--surface-2);border:1px dashed var(--line-strong);
+  border-radius:6px;color:var(--text-3);font-size:12px;padding:4px 10px;
+  cursor:pointer}
+.capAdd:hover{color:var(--text);border-color:var(--accent)}
+
+/* Audit verdict */
+.audit{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;
+  border-radius:10px;padding:10px 12px;margin-bottom:14px;line-height:1.4}
+.audit.bad{background:rgba(255,97,107,.08);border:1px solid rgba(255,97,107,.3);
+  color:#ffb3b8}
+.audit.good{background:rgba(61,214,140,.07);border:1px solid rgba(61,214,140,.3);
+  color:#9fe8c4}
+.audit b{display:block;font-size:12px;text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:4px}
+.auditPill{font-size:10.5px;font-weight:700;border-radius:99px;padding:2px 8px;
+  border:1px solid;flex-shrink:0;font-variant-numeric:tabular-nums}
+.auditPill.ok{color:var(--ok);border-color:rgba(61,214,140,.4)}
+.auditPill.warn{color:var(--err);border-color:rgba(255,97,107,.4)}
+
+/* Framing */
+.scnStrip{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));
+  gap:12px}
+.scn{border:1px solid var(--line);border-radius:10px;padding:9px;
+  background:var(--surface)}
+.scn.sel{border-color:var(--accent)}
+.scnImg{position:relative;border-radius:7px;overflow:hidden;background:#000;
+  line-height:0}
+.scnImg img{width:100%;display:block}
+.scnCrop{position:absolute;top:0;bottom:0;border:2px solid var(--accent);
+  background:rgba(255,90,54,.14);box-shadow:0 0 0 9999px rgba(0,0,0,.42);
+  pointer-events:none}
+.scn label{display:block;font-size:11.5px;color:var(--text-3);margin:8px 0 3px}
+input[type=range]{width:100%;accent-color:var(--accent);background:transparent;
+  border:none;padding:0;height:22px}
+input[type=range]:focus{box-shadow:none}
+.scnTime{font-family:var(--mono);font-size:10.5px;color:var(--text-3)}
+
+/* Color fields */
+input[type=color]{width:44px;height:38px;border:1px solid var(--line-strong);
+  border-radius:8px;background:var(--bg);padding:2px;cursor:pointer}
+.swatch{display:flex;align-items:center;gap:9px}
+.swatch code{font-family:var(--mono);font-size:11.5px;color:var(--text-3)}
+
+/* Last rule on purpose: .hidden must win the specificity tie against any
+   component's own display value (e.g. .error{display:flex}). */
 .hidden{display:none}
 </style>
 </head>
 <body>
-<nav><strong>OpenShorts</strong><span style="color:#71717a;font-size:13px">Long video → Shorts</span></nav>
-<div class="container">
-<h1>🎬 Video → Shorts</h1>
-<p class="sub">AI picks the best moments, reframes to 9:16, adds karaoke captions & zooms</p>
 
-<div class="card">
-  <label>YouTube URL</label>
-  <input type="text" id="url" placeholder="https://youtube.com/watch?v=..." />
-  <div style="text-align:center;color:#52525b;margin:12px 0;font-size:13px">— or —</div>
-  <label>Upload Video File</label>
-  <input type="file" id="file" accept="video/*" style="width:100%;color:#a1a1aa;font-size:14px" />
-
-  <div class="row">
-    <div>
-      <label>Format</label>
-      <select id="format">
-        <option value="vertical">Vertical 9:16</option>
-        <option value="horizontal">Horizontal</option>
-        <option value="square">Square</option>
-        <option value="auto">Auto</option>
-      </select>
+<div class="app">
+  <aside>
+    <div class="brand"><span class="dot"></span>OpenShorts</div>
+    <div class="brand-sub">Long video → shorts studio</div>
+    <nav>
+      <button class="nav-item active" data-view="create" onclick="showView('create')">
+        <span class="ico">✂</span>Create</button>
+      <button class="nav-item" data-view="library" onclick="showView('library')">
+        <span class="ico">🗂</span>Library<span class="badge-count" id="libCount"></span></button>
+      <button class="nav-item" data-view="settings" onclick="showView('settings')">
+        <span class="ico">⚙</span>Settings</button>
+    </nav>
+    <div class="spacer"></div>
+    <div class="engine">
+      <div class="row"><span class="pip" id="enginePip"></span><b id="engineState">Engine online</b></div>
+      <div class="model" id="engineModel">—</div>
     </div>
-    <div>
-      <label>Max Clips</label>
-      <input type="number" id="maxClips" value="3" min="1" max="10" />
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <h1 id="pageTitle">Create</h1>
+      <span class="sub" id="pageSub">Turn a long video into shorts</span>
+      <div class="spacer"></div>
+      <span class="sub" style="font-family:var(--mono)">localhost:8001</span>
+      <div class="topline" id="topline"><div class="bar"></div></div>
+    </div>
+
+    <!-- ═══ CREATE ═══ -->
+    <section class="view active" id="view-create">
+      <section class="card">
+        <h3>1 · Source</h3>
+        <div class="field">
+          <label for="url">YouTube URL</label>
+          <input type="text" id="url" placeholder="https://youtube.com/watch?v=…" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="divider">or drop a file</div>
+        <div class="dropzone" id="dropzone" role="button" tabindex="0"
+             aria-label="Choose a video file or drop one here">
+          <div class="dz-title" id="dzTitle">Choose a video file</div>
+          <div class="dz-sub" id="dzSub">MP4 / MOV / MKV — or drag &amp; drop it here</div>
+          <input type="file" id="file" accept="video/*" />
+        </div>
+
+        <h3 style="margin-top:22px">2 · Output</h3>
+        <div class="controls">
+          <div>
+            <label for="format" style="display:block;font-size:12.5px;font-weight:600;color:var(--text-2);margin-bottom:7px">Format</label>
+            <div class="seg" id="format" role="group" aria-label="Output format">
+              <button type="button" data-v="vertical" aria-pressed="true">Vertical 9:16</button>
+              <button type="button" data-v="square" aria-pressed="false">Square</button>
+              <button type="button" data-v="horizontal" aria-pressed="false">Horizontal</button>
+              <button type="button" data-v="auto" aria-pressed="false">Auto</button>
+            </div>
+          </div>
+          <div>
+            <label style="display:block;font-size:12.5px;font-weight:600;color:var(--text-2);margin-bottom:7px">Max clips</label>
+            <div class="stepper">
+              <button type="button" id="clipsDown" aria-label="Fewer clips">−</button>
+              <input type="number" id="maxClips" value="3" min="1" max="10" inputmode="numeric" aria-label="Maximum number of clips" />
+              <button type="button" id="clipsUp" aria-label="More clips">+</button>
+            </div>
+          </div>
+          <div>
+            <label for="style" style="display:block;font-size:12.5px;font-weight:600;color:var(--text-2);margin-bottom:7px">Look for</label>
+            <div class="seg" id="style" role="group" aria-label="Kind of moments to find">
+              <button type="button" data-v="general" aria-pressed="true">Best moments</button>
+              <button type="button" data-v="funny" aria-pressed="false">Funny</button>
+              <button type="button" data-v="peak" aria-pressed="false">Peak</button>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn" id="goBtn" onclick="submit()">Generate shorts</button>
+        <div id="errorBox" class="error hidden" role="alert"></div>
+      </section>
+
+      <section class="card" id="status" style="display:none">
+        <div class="run-head">
+          <span class="badge badge-queued" id="statusBadge" role="status"><span class="pip"></span><span id="badgeText">queued</span></span>
+          <span class="elapsed" id="elapsed"></span>
+          <div class="spacer"></div>
+        </div>
+        <div class="logwrap"><div id="statusLog" aria-live="polite"></div></div>
+      </section>
+
+      <div id="clips" style="display:none">
+        <div class="clips-head">
+          <h2>Your clips</h2><span class="count" id="clipCount"></span>
+        </div>
+        <div id="clipList"></div>
+        <button class="btn btn-ghost" style="margin-top:16px" onclick="downloadAll()">Download all (ZIP)</button>
+      </div>
+    </section>
+
+    <!-- ═══ LIBRARY ═══ -->
+    <section class="view" id="view-library">
+      <div class="lede">
+        <h2>Library</h2>
+        <p>Every clip this server has rendered, straight from disk. Re-download any job, even after a restart.</p>
+      </div>
+      <div id="jobList"></div>
+    </section>
+
+    <!-- ═══ SETTINGS ═══ -->
+    <section class="view" id="view-settings">
+      <div class="lede">
+        <h2>Settings</h2>
+        <p>Engine configuration is written to <code style="font-family:var(--mono);font-size:12.5px">.env</code> and applied live to the next job.</p>
+      </div>
+
+      <section class="card">
+        <h3>Engine</h3>
+        <dl class="kv" id="engineKv">
+          <dt>Mode</dt><dd id="kvMode">—</dd>
+          <dt>Provider</dt><dd id="kvProvider">—</dd>
+          <dt>Model</dt><dd id="kvModel">—</dd>
+          <dt>Endpoint</dt><dd id="kvEndpoint">—</dd>
+          <dt>Job retention</dt><dd id="kvRetention">—</dd>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h3>Captions</h3>
+        <p class="cfg-note" style="margin-bottom:12px">The karaoke look burned into every new clip. Live previews below use each template's real colors, outline and effect.</p>
+        <div class="field">
+          <label for="cfg_CAPTION_TEMPLATE">Template</label>
+          <select id="cfg_CAPTION_TEMPLATE"></select>
+        </div>
+        <div id="tplPreview" class="tpl-preview">
+          <span class="tpl-word">SHE</span> <span class="tpl-word tpl-active">SAID</span> <span class="tpl-word">YES</span>
+        </div>
+        <div id="tplMeta" class="cfg-note"></div>
+        <button class="btn btn-ghost btn-inline" onclick="saveTemplate()">Save template</button>
+        <div id="tplSaveStatus" class="cfg-status" role="status"></div>
+      </section>
+
+      <section class="card">
+        <h3>Key pool</h3>
+        <p class="cfg-note" style="margin-bottom:12px">Several Groq keys rotate on rate-limit — free-tier limits are per-account, so each key adds its own budget to both transcription and clip scoring. On a limit hit the pipeline rotates to the next key, and only if every key is exhausted does it wait for the token window to refill.</p>
+        <div class="field">
+          <label for="cfg_GROQ_API_KEYS">Groq keys <span style="color:var(--text-3);font-weight:400">(comma-separated — leave empty to keep the single key)</span></label>
+          <input type="password" id="cfg_GROQ_API_KEYS" placeholder="unchanged" autocomplete="new-password" spellcheck="false" oninput="countPoolKeys()" />
+          <div class="cfg-note" id="poolCount"></div>
+        </div>
+        <button class="btn btn-ghost btn-inline" onclick="savePool()">Save keys</button>
+        <div id="poolStatus" class="kv" style="margin-top:12px"></div>
+        <div id="poolSaveStatus" class="cfg-status" role="status"></div>
+      </section>
+
+      <section class="card" id="configCard">
+        <button class="cfg-toggle" id="cfgToggle" aria-expanded="false" aria-controls="configPanel">
+          <span>⚙ Model &amp; provider config</span><span class="chev">▸</span>
+        </button>
+        <div id="configPanel" class="hidden">
+          <div class="cfg-grid">
+            <div class="full">
+              <label for="cfg_LLM_BASE_URL">LLM base URL <span style="color:var(--text-3);font-weight:400">(clip picker)</span></label>
+              <input type="text" id="cfg_LLM_BASE_URL" placeholder="https://api.groq.com/openai/v1" spellcheck="false" />
+            </div>
+            <div>
+              <label for="cfg_LLM_MODEL">Model</label>
+              <input type="text" id="cfg_LLM_MODEL" placeholder="openai/gpt-oss-120b" spellcheck="false" />
+            </div>
+            <div>
+              <label for="cfg_LLM_SCORE_BATCH">Score batch <span style="color:var(--text-3);font-weight:400">(windows/call)</span></label>
+              <input type="number" id="cfg_LLM_SCORE_BATCH" min="1" max="8" />
+              <div class="cfg-note">1 is safest on free-tier token limits</div>
+            </div>
+            <div class="full">
+              <label for="cfg_LLM_API_KEY">LLM API key</label>
+              <input type="password" id="cfg_LLM_API_KEY" placeholder="unchanged" autocomplete="new-password" />
+            </div>
+            <div>
+              <label for="cfg_TRANSCRIBE_BACKEND">Transcription</label>
+              <select id="cfg_TRANSCRIBE_BACKEND">
+                <option value="groq">Groq (cloud)</option>
+                <option value="whisper">Local Whisper</option>
+              </select>
+            </div>
+            <div>
+              <label for="cfg_GROQ_ASR_MODEL">ASR model</label>
+              <input type="text" id="cfg_GROQ_ASR_MODEL" placeholder="whisper-large-v3" spellcheck="false" />
+              <div class="cfg-note">Word-level captions need whisper-large-v3</div>
+            </div>
+            <div class="full">
+              <label for="cfg_GEMINI_API_KEY">Gemini API key <span style="color:var(--text-3);font-weight:400">(vision / layout)</span></label>
+              <input type="password" id="cfg_GEMINI_API_KEY" placeholder="unchanged" autocomplete="new-password" />
+            </div>
+            <div>
+              <label for="cfg_AUTO_LAYOUT">Auto layout</label>
+              <select id="cfg_AUTO_LAYOUT"><option value="1">On</option><option value="0">Off</option></select>
+            </div>
+            <div>
+              <label for="cfg_CRITIQUE_GATE">Critique gate</label>
+              <select id="cfg_CRITIQUE_GATE"><option value="1">On</option><option value="0">Off</option></select>
+            </div>
+          </div>
+          <button class="btn btn-ghost btn-inline" onclick="saveConfig()">Save config (writes .env)</button>
+          <div id="cfgStatus" class="cfg-status" role="status"></div>
+        </div>
+      </section>
+    </section>
+  </div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<!-- ═══ CLIP EDITOR ═══ -->
+<div id="editor" class="editor hidden" role="dialog" aria-modal="true" aria-label="Clip editor">
+  <div class="edHead">
+    <span class="et" id="edTitle">Clip</span>
+    <span class="em" id="edMeta"></span>
+    <div class="spacer"></div>
+    <button class="btn btn-ghost btn-inline" id="edDl">⬇ Download</button>
+    <button class="edClose" id="edCloseBtn" aria-label="Close editor">✕</button>
+  </div>
+  <div class="edBody">
+    <div class="edSide">
+      <video id="edVideo" controls playsinline></video>
+      <div id="edVerdict"></div>
+      <div class="edStatus" id="edStatus"></div>
+    </div>
+    <div class="edMain">
+      <div class="edTabs" role="tablist">
+        <button class="edTab" role="tab" data-tab="cut" aria-selected="true">Cut</button>
+        <button class="edTab" role="tab" data-tab="captions" aria-selected="false">Captions</button>
+        <button class="edTab" role="tab" data-tab="frame" aria-selected="false">Framing</button>
+        <button class="edTab" role="tab" data-tab="hook" aria-selected="false">Hook text</button>
+      </div>
+
+      <!-- Cut -->
+      <div class="edPanel" id="panel-cut">
+        <div class="tl">
+          <div class="tlTop">
+            <b id="tlDur">—</b>
+            <span id="tlNote"></span>
+            <div class="spacer"></div>
+            <span id="tlPos"></span>
+          </div>
+          <div class="tlTrack" id="tlTrack">
+            <div class="tlWords" id="tlWords"></div>
+            <div class="tlRuler" id="tlRuler"></div>
+            <div class="tlPlay" id="tlPlay"></div>
+          </div>
+          <div class="tlTools">
+            <button class="tlChip" id="tlSnap" aria-pressed="true">Snap to words</button>
+            <button class="tlChip" id="tlSplit">✂ Split at playhead</button>
+            <button class="tlChip" id="tlDrop">🗑 Remove segment</button>
+            <button class="tlChip" id="tlMerge">↳ Merge with previous</button>
+            <button class="tlChip" id="tlFit">Reset to original cut</button>
+          </div>
+        </div>
+        <p class="edHint" id="tlLimits"></p>
+        <div class="edRow">
+          <div class="field">
+            <label for="edFraming">Framing</label>
+            <select id="edFraming">
+              <option value="auto">Auto (pipeline's choice)</option>
+              <option value="full">Full frame — no crop</option>
+              <option value="track">Track the subject</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="edReapply">Captions</label>
+            <select id="edReapply">
+              <option value="1">Re-apply after the cut</option>
+              <option value="0">Leave uncaptioned</option>
+            </select>
+          </div>
+        </div>
+        <div class="edBtns">
+          <button class="btn" id="edSaveCut">Save &amp; re-render</button>
+          <span class="edStatus" id="edCutStatus"></span>
+        </div>
+      </div>
+
+      <!-- Captions -->
+      <div class="edPanel hidden" id="panel-captions">
+        <div id="capVerdict"></div>
+        <div class="edRow">
+          <div class="field">
+            <label for="capPreset">Template</label>
+            <select id="capPreset"></select>
+          </div>
+          <div class="field">
+            <label for="capStyle">Reveal</label>
+            <select id="capStyle">
+              <option value="karaoke">Karaoke (word by word)</option>
+              <option value="classic">Classic (whole line)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="capPos">Position</label>
+            <select id="capPos">
+              <option value="bottom">Bottom</option>
+              <option value="middle">Middle</option>
+              <option value="top">Top</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="capSize">Size</label>
+            <input type="number" id="capSize" min="12" max="90" />
+          </div>
+          <div class="field">
+            <label for="capChars">Max chars / line</label>
+            <input type="number" id="capChars" min="8" max="40" />
+          </div>
+        </div>
+        <div class="edRow">
+          <div class="field">
+            <label for="capColor">Text</label>
+            <div class="swatch"><input type="color" id="capColor" /><code id="capColorHex"></code></div>
+          </div>
+          <div class="field">
+            <label for="capHi">Active word</label>
+            <div class="swatch"><input type="color" id="capHi" /><code id="capHiHex"></code></div>
+          </div>
+          <div class="field">
+            <label for="capBorder">Outline</label>
+            <div class="swatch"><input type="color" id="capBorder" /><code id="capBorderHex"></code></div>
+          </div>
+          <div class="field">
+            <label for="capBorderW">Outline width</label>
+            <input type="number" id="capBorderW" min="0" max="12" />
+          </div>
+          <div class="field">
+            <label for="capEffect">Effect</label>
+            <select id="capEffect">
+              <option value="pop">Pop</option>
+              <option value="glow">Glow</option>
+              <option value="box">Box</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="capDim">Dim inactive <span id="capDimVal" style="color:var(--text-3)"></span></label>
+            <input type="range" id="capDim" min="20" max="100" step="5" />
+          </div>
+          <div class="field">
+            <label for="capUpper">Case</label>
+            <select id="capUpper">
+              <option value="1">UPPERCASE</option>
+              <option value="0">Sentence case</option>
+            </select>
+          </div>
+        </div>
+        <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text-3);margin:18px 0 10px">
+          Caption text <span style="text-transform:none;letter-spacing:0;font-weight:400">— click any word to fix what the transcription got wrong</span></h3>
+        <div id="capBlocks"></div>
+        <div class="edBtns">
+          <button class="btn" id="capApply">Apply captions</button>
+          <button class="btn btn-ghost btn-inline" id="capRemove">Remove captions</button>
+          <span class="edStatus" id="capStatus"></span>
+        </div>
+      </div>
+
+      <!-- Framing -->
+      <div class="edPanel hidden" id="panel-frame">
+        <p class="edHint">Scene-by-scene crop on the <b>uncropped</b> source, so you can see what
+          the automatic framing threw away. Each shot gets its own centre; un-touched shots keep
+          the whole-clip framing above.</p>
+        <div id="frPreview" class="hidden"><video id="frVideo" controls playsinline
+             style="width:100%;max-height:40vh;background:#000;border-radius:10px;border:1px solid var(--line)"></video></div>
+        <div id="frStrip" class="scnStrip"></div>
+        <div class="edBtns">
+          <button class="btn" id="frSave">Apply framing</button>
+          <button class="btn btn-ghost btn-inline" id="frLoad">Load scenes</button>
+          <span class="edStatus" id="frStatus"></span>
+        </div>
+      </div>
+
+      <!-- Hook -->
+      <div class="edPanel hidden" id="panel-hook">
+        <div class="edRow">
+          <div class="field wide">
+            <label for="hookText">Hook text</label>
+            <input type="text" id="hookText" placeholder="The line burned at the top of the clip" />
+          </div>
+        </div>
+        <div class="edRow">
+          <div class="field">
+            <label for="hookPos">Position</label>
+            <select id="hookPos">
+              <option value="top">Top</option><option value="center">Center</option><option value="bottom">Bottom</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="hookSize">Size</label>
+            <select id="hookSize"><option>S</option><option selected>M</option><option>L</option></select>
+          </div>
+          <div class="field">
+            <label for="hookStyle">Style</label>
+            <select id="hookStyle">
+              <option value="classic">Classic</option><option value="dark">Dark</option>
+              <option value="yellow">Yellow</option><option value="red">Red</option>
+              <option value="outline">Outline</option><option value="outline_yellow">Yellow outline</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="hookDur">Visible for (s)</label>
+            <input type="number" id="hookDur" min="0" step="0.5" placeholder="whole clip" />
+          </div>
+        </div>
+        <div class="edBtns">
+          <button class="btn" id="hookApply">Apply hook</button>
+          <button class="btn btn-ghost btn-inline" id="hookRemove">Remove hook</button>
+          <span class="edStatus" id="hookStatus"></span>
+        </div>
+      </div>
     </div>
   </div>
-
-  <button class="btn" id="goBtn" onclick="submit()">🚀 Generate Shorts</button>
-  <div id="errorBox" class="error hidden"></div>
-</div>
-
-<div class="card" id="configCard">
-  <label style="cursor:pointer;display:flex;justify-content:space-between;align-items:center">
-    <span>⚙️ Model & Provider Config</span>
-    <span id="cfgChevron">▸</span>
-  </label>
-  <div id="configPanel" class="hidden" style="margin-top:14px">
-    <label>LLM Base URL (clip picker)</label>
-    <input type="text" id="cfg_LLM_BASE_URL" placeholder="https://api.groq.com/openai/v1" />
-    <div class="row">
-      <div><label>Model</label><input type="text" id="cfg_LLM_MODEL" placeholder="openai/gpt-oss-120b" /></div>
-      <div><label>Score Batch (windows/call)</label><input type="number" id="cfg_LLM_SCORE_BATCH" min="1" max="8" /></div>
-    </div>
-    <label>LLM API Key</label>
-    <input type="password" id="cfg_LLM_API_KEY" placeholder="gsk_..." />
-    <div class="row">
-      <div>
-        <label>Transcription</label>
-        <select id="cfg_TRANSCRIBE_BACKEND">
-          <option value="groq">Groq (cloud)</option>
-          <option value="whisper">Local Whisper</option>
-        </select>
-      </div>
-      <div><label>ASR Model</label><input type="text" id="cfg_GROQ_ASR_MODEL" placeholder="whisper-large-v3" /></div>
-    </div>
-    <label>Gemini API Key (vision/layout)</label>
-    <input type="password" id="cfg_GEMINI_API_KEY" placeholder="AIza..." />
-    <div class="row">
-      <div>
-        <label>Auto Layout</label>
-        <select id="cfg_AUTO_LAYOUT"><option value="1">On</option><option value="0">Off</option></select>
-      </div>
-      <div>
-        <label>Critique Gate</label>
-        <select id="cfg_CRITIQUE_GATE"><option value="1">On</option><option value="0">Off</option></select>
-      </div>
-    </div>
-    <button class="btn btn-secondary" onclick="saveConfig()">💾 Save Config (writes .env)</button>
-    <div id="cfgStatus" style="font-size:13px;color:#4ade80;margin-top:8px"></div>
-  </div>
-</div>
-
-<div class="card" id="status">
-  <span class="statusBadge status-queued" id="statusBadge">queued</span>
-  <div id="statusLog"></div>
-</div>
-
-<div id="clips">
-  <h2 style="font-size:18px;margin-bottom:4px">✅ Your Clips</h2>
-  <div id="clipList"></div>
-  <button class="btn btn-secondary downloadAll" onclick="downloadAll()">📦 Download All Clips (ZIP)</button>
-</div>
 </div>
 
 <script>
 let jobId = null;
 let pollTimer = null;
+let startedAt = 0;
+let elapsedTimer = null;
+
+/* ── Views ── */
+const VIEW_META = {
+  create:   ['Create',   'Turn a long video into shorts'],
+  library:  ['Library',  'Every clip this server has rendered'],
+  settings: ['Settings', 'Engine and provider configuration'],
+};
+function showView(name) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + name).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(b =>
+    b.classList.toggle('active', b.dataset.view === name));
+  document.getElementById('pageTitle').textContent = VIEW_META[name][0];
+  document.getElementById('pageSub').textContent = VIEW_META[name][1];
+  if (location.hash !== '#/' + name) history.replaceState(null, '', '#/' + name);
+  if (name === 'library') loadLibrary();
+  if (name === 'settings') loadEngineInfo();
+}
+window.addEventListener('hashchange', () => {
+  const v = (location.hash || '').replace('#/', '');
+  if (VIEW_META[v] && !document.getElementById('view-' + v).classList.contains('active')) showView(v);
+});
+
+/* ── Toasts ── */
+function toast(msg, kind) {
+  const box = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast ' + (kind || '');
+  el.innerHTML = `<span class="ico">${kind === 'err' ? '⚠' : kind === 'ok' ? '✓' : 'ℹ'}</span><span>${msg}</span>`;
+  box.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; }, 4200);
+  setTimeout(() => el.remove(), 4700);
+}
+
+/* ── Engine status (sidebar + settings) ── */
+async function pingEngine() {
+  try {
+    const res = await fetch('/health');
+    if (!res.ok) throw new Error(res.status);
+    document.getElementById('enginePip').classList.remove('down');
+    document.getElementById('engineState').textContent = 'Engine online';
+  } catch (e) {
+    document.getElementById('enginePip').classList.add('down');
+    document.getElementById('engineState').textContent = 'Engine offline';
+  }
+}
+async function loadEngineInfo() {
+  try {
+    const cfg = await (await fetch('/api/config')).json();
+    const llm = cfg.localLlm || {};
+    document.getElementById('kvMode').textContent =
+      cfg.billingEnabled ? 'Cloud (billing)' : 'Self-host';
+    document.getElementById('kvProvider').textContent = llm.provider || 'gemini';
+    document.getElementById('kvModel').textContent = llm.model || '—';
+    document.getElementById('kvEndpoint').textContent = llm.baseUrl || 'Google Gemini';
+    document.getElementById('kvRetention').textContent =
+      Math.round((cfg.jobRetentionSeconds || 0) / 3600) + ' h';
+    const pool = cfg.keyPool || [];
+    document.getElementById('engineModel').textContent =
+      (llm.model || 'gemini') + ' · ' + (llm.provider || 'gemini')
+      + (pool.length > 1 ? ` · ${pool.length} keys` : '');
+    renderPoolStatus(pool);
+  } catch (e) { /* engine info is decoration */ }
+}
+
+function renderPoolStatus(pool) {
+  const box = document.getElementById('poolStatus');
+  if (!pool.length) {
+    box.innerHTML = '<dt>Pool</dt><dd>single key — add more above to multiply free-tier limits</dd>';
+    return;
+  }
+  const ready = pool.filter(k => k.state === 'ready').length;
+  let html = `<dt>Keys</dt><dd>${ready}/${pool.length} ready</dd>`;
+  pool.forEach(k => {
+    const cls = k.state === 'ready' ? 'var(--ok)' : 'var(--info)';
+    const label = k.state === 'ready'
+      ? 'ready'
+      : `cooling ${Math.round(k.cooling_for)}s`;
+    html += `<dt style="font-family:var(--mono)">${k.masked}</dt>
+      <dd><span style="color:${cls}">●</span> ${label}</dd>`;
+  });
+  box.innerHTML = html;
+}
+
+/* Live "N keys entered" under the pool field — the field is a password box
+   (masked), so without this there is no feedback that typing worked. */
+function countPoolKeys() {
+  const el = document.getElementById('cfg_GROQ_API_KEYS');
+  const n = el.value.split(/[,\s]+/).filter(Boolean).length;
+  document.getElementById('poolCount').textContent = n
+    ? `${n} key${n > 1 ? 's' : ''} entered — press Save keys`
+    : '';
+}
+
+/* Save just the pool (its own button: the generic Save lives in the collapsed
+   config panel below, which nobody finds). */
+async function savePool() {
+  const el = document.getElementById('cfg_GROQ_API_KEYS');
+  const status = document.getElementById('poolSaveStatus');
+  try {
+    const res = await fetch('/api/provider-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({updates: {GROQ_API_KEYS: el.value}})
+    });
+    const j = await res.json();
+    status.textContent = `✓ Saved — ${j.applied.join(', ')}`;
+    status.style.color = 'var(--ok)';
+    toast('Key pool saved — applies to the next job', 'ok');
+    setTimeout(() => { status.textContent = ''; }, 5000);
+    loadEngineInfo();
+  } catch (e) {
+    status.textContent = `✕ Save failed: ${e.message}`;
+    status.style.color = 'var(--err)';
+  }
+}
+
+/* ── Format segmented control ── */
+const formatSeg = document.getElementById('format');
+let formatValue = 'vertical';
+formatSeg.querySelectorAll('button').forEach(b => {
+  b.addEventListener('click', () => {
+    formatSeg.querySelectorAll('button').forEach(x =>
+      x.setAttribute('aria-pressed', String(x === b)));
+    formatValue = b.dataset.v;
+  });
+});
+
+/* ── "Look for" segmented control (content_style) ── */
+const styleSeg = document.getElementById('style');
+let styleValue = 'general';
+styleSeg.querySelectorAll('button').forEach(b => {
+  b.addEventListener('click', () => {
+    styleSeg.querySelectorAll('button').forEach(x =>
+      x.setAttribute('aria-pressed', String(x === b)));
+    styleValue = b.dataset.v;
+  });
+});
+
+/* ── Max-clips stepper ── */
+const clipsInput = document.getElementById('maxClips');function clampClips() {
+  clipsInput.value = String(Math.min(10, Math.max(1, parseInt(clipsInput.value) || 3)));
+  document.getElementById('clipsDown').disabled = clipsInput.value <= 1;
+  document.getElementById('clipsUp').disabled = clipsInput.value >= 10;
+}
+clipsInput.addEventListener('change', clampClips);
+document.getElementById('clipsDown').onclick = () => { clipsInput.value = +clipsInput.value - 1; clampClips(); };
+document.getElementById('clipsUp').onclick = () => { clipsInput.value = +clipsInput.value + 1; clampClips(); };
+
+/* ── Drag & drop import ── */
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('file');
+dropzone.onclick = () => fileInput.click();
+dropzone.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } };
+['dragenter','dragover'].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault(); dropzone.classList.add('drag'); }));
+['dragleave','drop'].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault(); dropzone.classList.remove('drag'); }));
+dropzone.addEventListener('drop', e => {
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) { fileInput.files = e.dataTransfer.files; syncDropzone(); }
+});
+fileInput.addEventListener('change', syncDropzone);
+function syncDropzone() {
+  const f = fileInput.files[0];
+  document.getElementById('dzTitle').textContent = f ? f.name : 'Choose a video file';
+  document.getElementById('dzSub').textContent = f
+    ? (f.size > 104857600 ? (f.size/1073741824).toFixed(2) + ' GB — ready' : Math.round(f.size/1048576) + ' MB — ready')
+    : 'MP4 / MOV / MKV — or drag & drop it here';
+  dropzone.classList.toggle('has-file', Boolean(f));
+}
 
 async function submit() {
   const url = document.getElementById('url').value.trim();
-  const file = document.getElementById('file').files[0];
-  const format = document.getElementById('format').value;
-  const maxClips = document.getElementById('maxClips').value || 3;
+  const file = fileInput.files[0];
+  const format = formatValue;
+  const maxClips = clipsInput.value || 3;
   const errBox = document.getElementById('errorBox');
 
   if (!url && !file) { showError('Paste a YouTube URL or choose a video file'); return; }
@@ -151,6 +1088,7 @@ async function submit() {
     const fd = new FormData();
     fd.append('output_format', format);
     fd.append('target_clips', maxClips);
+    fd.append('content_style', styleValue);
     fd.append('acknowledged', 'true');
     fd.append('captions', 'true');
     if (url) fd.append('url', url);
@@ -164,12 +1102,24 @@ async function submit() {
     const data = await res.json();
     jobId = data.job_id;
     document.getElementById('status').style.display = 'block';
-    setBadge('queued');
+    document.getElementById('clips').style.display = 'none';
+    document.getElementById('statusLog').textContent = '';
+    setBadge('queued');  // also arms the top progress line
+    startedAt = Date.now();
+    elapsedTimer = setInterval(tickElapsed, 1000); tickElapsed();
+    toast('Job started — watching the log', 'ok');
     poll();
   } catch (e) {
-    showError(e.message);
+    showError(e.message + botHint(e.message));
     resetBtn();
   }
+}
+
+function tickElapsed() {
+  const s = Math.floor((Date.now() - startedAt) / 1000);
+  const m = Math.floor(s / 60);
+  document.getElementById('elapsed').textContent =
+    `${m}:${String(s % 60).padStart(2, '0')} elapsed`;
 }
 
 function poll() {
@@ -179,44 +1129,166 @@ function poll() {
       if (!res.ok) return;
       const data = await res.json();
       setBadge(data.status);
-      document.getElementById('statusLog').textContent = (data.logs || []).join('\n');
-      document.getElementById('statusLog').scrollTop = document.getElementById('statusLog').scrollHeight;
+      const log = document.getElementById('statusLog');
+      log.textContent = (data.logs || []).join('\n');
+      log.scrollTop = log.scrollHeight;
 
       if (data.status === 'done') {
-        clearInterval(pollTimer);
+        clearInterval(pollTimer); clearInterval(elapsedTimer);
         showClips(data.result);
         resetBtn();
+        toast('Clips ready', 'ok');
       } else if (data.status === 'error') {
-        clearInterval(pollTimer);
+        clearInterval(pollTimer); clearInterval(elapsedTimer);
         const lastErr = (data.logs || []).filter(l => l.includes('❌')).pop() || 'Processing failed';
-        showError(lastErr);
+        showError(lastErr + botHint(lastErr));
+        toast('Processing failed', 'err');
         resetBtn();
       }
     } catch (e) { /* keep polling */ }
   }, 3000);
 }
 
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* The audit's machine codes explained for a viewer. Kept short: the editor
+   panel carries the full detail the server measured. */
+const AUDIT_COPY = {
+  no_speech: 'no speech in this range',
+  opens_mid_sentence: 'starts mid-sentence',
+  ends_mid_sentence: 'ends mid-sentence',
+  too_fast_to_read: 'more text than you can read',
+  repeated_text: 'a phrase repeats (transcription loop)',
+  gibberish: 'unrecognisable words',
+  junk_text: 'transcription boilerplate ("like and subscribe")',
+  sparse_speech: 'barely any speech',
+  impossible_density: 'transcript is out of sync with the audio',
+};
+
+function auditPill(review) {
+  if (!review) return '';
+  const n = (review.issues || []).length;
+  if (review.ok || !n) {
+    return '<span class="auditPill ok" title="Captions read as speech">✓ captions read</span>';
+  }
+  const names = review.issues.map(i => AUDIT_COPY[i] || i).join(', ');
+  return `<span class="auditPill warn" title="${esc(names)}">⚠ ${n} caption</span>`;
+}
+
+function clipCardInner(c, i, jobForEditor) {
+  const url = c.video_url || c.url || '';
+  // The pipeline's short-form title lives under video_title_for_youtube_short;
+  // the live result carried none, which rendered every card "untitled".
+  const name = (c.title || c.video_title_for_youtube_short
+                || c.viral_hook_text || `Clip ${i+1}`);
+  const dlName = `short_${String(i+1).padStart(2,'0')}_${name.replace(/[^a-z0-9]/gi,'_').slice(0,40)}.mp4`;
+  const score = c.predicted_score;
+  const scoreCls = score == null ? 'score-low'
+    : score >= 80 ? 'score-hi' : score >= 60 ? 'score-mid' : 'score-low';
+  return `
+      <video src="${url}" preload="metadata" controls muted></video>
+      <div class="clipInfo">
+        <div class="clipTop">
+          <span class="clipIdx">${String(i+1).padStart(2,'0')}</span>
+          <span class="clipTitle">${esc(name)}</span>
+          ${auditPill(c.caption_review)}
+          <span class="score ${scoreCls}">${score ?? ''}</span>
+        </div>
+        ${c.viral_hook_text ? `<div class="clipHook">${esc(c.viral_hook_text)}</div>` : ''}
+        <div style="display:flex;gap:8px;margin-top:auto">
+          <a class="clipBtn" href="${url}" download="${dlName}"
+             onclick="event.preventDefault();forceDownload('${url}','${dlName}')">⬇ Download MP4</a>
+          <button class="clipBtn" onclick="openEditor('${jobForEditor}',${i},'${url.replace(/'/g,'%27')}')">✎ Edit</button>
+        </div>
+      </div>`;
+}
+
 function showClips(result) {
   const container = document.getElementById('clipList');
   container.innerHTML = '';
   const clips = (result && result.clips) || [];
+  liveClips = clips;
+  CLIP_CACHE[jobId] = clips;
+  document.getElementById('clipCount').textContent =
+    clips.length ? `${clips.length} clip${clips.length > 1 ? 's' : ''}` : '';
   if (!clips.length) {
-    container.innerHTML = '<p style="color:#71717a;padding:20px 0">No clips in result — check logs above.</p>';
+    container.innerHTML = '<p class="empty">No clips in result — check the log above.</p>';
   }
   clips.forEach((c, i) => {
-    const url = c.url || `/videos/${jobId}/${c.file || ''}`;
     const card = document.createElement('div');
     card.className = 'clipCard';
-    card.innerHTML = `
-      <video src="${url}" preload="metadata" controls muted></video>
-      <div class="clipInfo">
-        <div class="clipTitle">${c.title || c.hook || `Clip ${i+1}`}</div>
-        <div class="clipMeta">Score: ${c.score ?? '—'} · ${c.duration || ''} ${c.start ? '· from '+fmtTime(c.start) : ''}</div>
-        <a class="clipBtn" href="${url}" download>⬇ Download</a>
-      </div>`;
+    card.innerHTML = clipCardInner(c, i, jobId);
     container.appendChild(card);
   });
   document.getElementById('clips').style.display = 'block';
+}
+
+/* ── Library ── */
+function relTime(ts) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+  return Math.floor(s / 86400) + ' d ago';
+}
+
+async function loadLibrary() {
+  const list = document.getElementById('jobList');
+  list.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div>';
+  try {
+    const data = await (await fetch('/api/jobs')).json();
+    const jobs = data.jobs || [];
+    document.getElementById('libCount').textContent = jobs.length || '';
+    list.innerHTML = '';
+    if (!jobs.length) {
+      list.innerHTML = `<div class="jobCard"><p class="empty">
+        <div class="big">🗂</div>
+        No clips yet. Finished jobs land here automatically.</p></div>`;
+      return;
+    }
+    jobs.forEach(job => {
+      CLIP_CACHE[job.job_id] = job.clips;
+      const card = document.createElement('div');
+      card.className = 'jobCard';
+      card.innerHTML = `
+        <div class="jobHead">
+          <span class="jt">${esc(job.label || job.job_id)}</span>
+          <span class="jm">${relTime(job.created)} · ${job.clips.length} clip${job.clips.length > 1 ? 's' : ''}</span>
+          <div class="spacer"></div>
+          <button class="jobZip" onclick="downloadJobZip('${job.job_id}')">⬇ ZIP</button>
+        </div>`;
+      job.clips.forEach((c, i) => {
+        const clip = document.createElement('div');
+        clip.className = 'clipCard';
+        clip.innerHTML = clipCardInner(c, i, job.job_id);
+        card.appendChild(clip);
+      });
+      list.appendChild(card);
+    });
+  } catch (e) {
+    list.innerHTML = `<div class="jobCard"><p class="empty">Could not load the library: ${e.message}</p></div>`;
+  }
+}
+
+function downloadJobZip(id) {
+  window.open(`/api/jobs/${id}/download-all`, '_blank');
+}
+
+function forceDownload(url, filename) {
+  // Cross-origin (tunnel) ignores the download attribute — fetch + blob instead.
+  fetch(url)
+    .then(r => { if (!r.ok) throw new Error(r.statusText); return r.blob(); })
+    .then(blob => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(e => { console.error('Download failed', e); window.open(url, '_blank'); });
 }
 
 function downloadAll() {
@@ -225,13 +1297,14 @@ function downloadAll() {
 
 function setBadge(s) {
   const b = document.getElementById('statusBadge');
-  b.textContent = s;
-  b.className = `statusBadge status-${s}`;
-}
-
-function fmtTime(s) {
-  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, '0')}`;
+  document.getElementById('badgeText').textContent = s;
+  b.className = `badge badge-${s}`;
+  // The top progress line follows the job so work-in-progress is visible
+  // from any view.
+  const line = document.getElementById('topline');
+  line.className = 'topline ' + (
+    s === 'done' ? 'done' : s === 'error' ? 'error' :
+    (s === 'queued' || s === 'processing') ? 'run' : '');
 }
 
 function showError(msg) {
@@ -240,20 +1313,32 @@ function showError(msg) {
   box.classList.remove('hidden');
 }
 
-function resetBtn() {
-  document.getElementById('goBtn').disabled = false;
-  document.getElementById('goBtn').textContent = '🚀 Generate Shorts';
+/* YouTube's bot check is per-IP and transient; the upload zone is the instant
+   escape hatch and cookies are the durable fix — say both, in place. */
+function botHint(err) {
+  if (/not a bot|LOGIN_REQUIRED|bot detection|cookies/i.test(err || '')) {
+    return ' — YouTube blocked this server\'s IP (usually clears within hours). ' +
+           'Fastest fix: download the video with any downloader and drop it into ' +
+           'the upload zone above. Durable fix: export cookies from your browser ' +
+           'and set YOUTUBE_COOKIES in .env, then restart the server.';
+  }
+  return '';
 }
 
-// --- Config panel ---
-document.querySelector('#configCard label').onclick = () => {
+function resetBtn() {
+  document.getElementById('goBtn').disabled = false;
+  document.getElementById('goBtn').textContent = 'Generate shorts';
+}
+
+/* ── Config panel ── */
+document.getElementById('cfgToggle').onclick = () => {
   const p = document.getElementById('configPanel');
-  p.classList.toggle('hidden');
-  document.getElementById('cfgChevron').textContent = p.classList.contains('hidden') ? '▸' : '▾';
-  if (!p.classList.contains('hidden')) loadConfig();
+  const open = p.classList.toggle('hidden') === false;
+  document.getElementById('cfgToggle').setAttribute('aria-expanded', String(open));
+  if (open) loadConfig();
 };
 
-const CFG_KEYS = ['LLM_BASE_URL','LLM_MODEL','LLM_API_KEY','LLM_SCORE_BATCH','TRANSCRIBE_BACKEND','GROQ_ASR_MODEL','GEMINI_API_KEY','AUTO_LAYOUT','CRITIQUE_GATE'];
+const CFG_KEYS = ['LLM_BASE_URL','LLM_MODEL','LLM_API_KEY','LLM_SCORE_BATCH','TRANSCRIBE_BACKEND','GROQ_ASR_MODEL','GROQ_API_KEYS','GEMINI_API_KEY','AUTO_LAYOUT','CRITIQUE_GATE'];
 
 async function loadConfig() {
   try {
@@ -261,7 +1346,15 @@ async function loadConfig() {
     const cfg = await res.json();
     CFG_KEYS.forEach(k => {
       const el = document.getElementById('cfg_' + k);
-      if (el && cfg[k] !== undefined) el.value = cfg[k];
+      if (!el || cfg[k] === undefined) return;
+      // Secrets come back masked ("••••bZpx"); show a placeholder instead of
+      // the mask so a save never writes the mask back as a key.
+      if (el.type === 'password' && String(cfg[k]).includes('•')) {
+        el.value = '';
+        el.placeholder = `${cfg[k]} (unchanged)`;
+      } else {
+        el.value = cfg[k];
+      }
     });
   } catch (e) { /* silent */ }
 }
@@ -270,7 +1363,8 @@ async function saveConfig() {
   const updates = {};
   CFG_KEYS.forEach(k => {
     const el = document.getElementById('cfg_' + k);
-    if (el && el.value !== '') updates[k] = el.value;
+    // Empty = leave unchanged (the endpoint also skips masked/empty secrets).
+    if (el && el.value !== '' && !el.value.includes('•')) updates[k] = el.value;
   });
   const status = document.getElementById('cfgStatus');
   try {
@@ -280,13 +1374,739 @@ async function saveConfig() {
       body: JSON.stringify({updates})
     });
     const j = await res.json();
-    status.textContent = `✅ Saved: ${j.applied.join(', ')}`;
-    status.style.color = '#4ade80';
+    status.textContent = `✓ Saved: ${j.applied.join(', ')}`;
+    status.style.color = 'var(--ok)';
+    toast('Config saved — applies to the next job', 'ok');
+    setTimeout(() => { status.textContent = ''; }, 5000);
+    loadEngineInfo();
+  } catch (e) {
+    status.textContent = `✕ Save failed: ${e.message}`;
+    status.style.color = 'var(--err)';
+    toast(`Save failed: ${e.message}`, 'err');
+  }
+}
+
+/* ── Caption template picker ── */
+let CAPTION_TEMPLATES = [];
+let activeTemplate = 'default';
+
+async function loadTemplates() {
+  try {
+    const data = await (await fetch('/api/caption-templates')).json();
+    CAPTION_TEMPLATES = data.templates || [];
+    activeTemplate = data.active || 'default';
+    const sel = document.getElementById('cfg_CAPTION_TEMPLATE');
+    sel.innerHTML = CAPTION_TEMPLATES.map(t =>
+      `<option value="${t.name}">${t.name}</option>`).join('');
+    sel.value = activeTemplate;
+    renderTemplatePreview(activeTemplate);
+    sel.onchange = () => renderTemplatePreview(sel.value);
+  } catch (e) { /* picker is decoration if the endpoint is unreachable */ }
+}
+
+function renderTemplatePreview(name) {
+  const t = CAPTION_TEMPLATES.find(x => x.name === name) || {};
+  const box = document.getElementById('tplPreview');
+  const words = box.querySelectorAll('.tpl-word');
+  const size = Math.round((t.font_size || 44) * 0.7);
+  const stroke = Math.min(4, Math.max(1, Math.round((t.border_width || 4) * 0.7)));
+  const opacity = t.base_opacity == null ? 1 : t.base_opacity;
+  const glow = t.effect === 'glow' || t.effect === 'box' ? t.highlight_color : 'transparent';
+  words.forEach(w => {
+    w.style.setProperty('--tpl-color', t.font_color || '#fff');
+    w.style.setProperty('--tpl-opacity', opacity);
+    w.style.setProperty('--tpl-hi', t.highlight_color || '#FFE500');
+    w.style.setProperty('--tpl-glow', glow);
+    w.style.fontSize = (w.classList.contains('tpl-active') ? size * 1.08 : size) + 'px';
+    w.style.webkitTextStroke = stroke + 'px ' + (t.border_color || '#000');
+    w.style.textTransform = t.uppercase ? 'uppercase' : 'none';
+  });
+  const bits = [
+    `font ${t.font_size}`,
+    `effect: ${t.effect}`,
+    t.uppercase ? 'UPPERCASE' : 'sentence case',
+    t.base_opacity < 1 ? `dimmed base (${Math.round(t.base_opacity * 100)}%)` : null,
+  ].filter(Boolean);
+  document.getElementById('tplMeta').textContent = bits.join(' · ');
+}
+
+async function saveTemplate() {
+  const sel = document.getElementById('cfg_CAPTION_TEMPLATE');
+  const status = document.getElementById('tplSaveStatus');
+  try {
+    const res = await fetch('/api/provider-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({updates: {CAPTION_TEMPLATE: sel.value}})
+    });
+    const j = await res.json();
+    status.textContent = `✓ Template "${sel.value}" saved — applies to the next clip`;
+    status.style.color = 'var(--ok)';
+    toast(`Caption template: ${sel.value}`, 'ok');
     setTimeout(() => { status.textContent = ''; }, 5000);
   } catch (e) {
-    status.textContent = `❌ Save failed: ${e.message}`;
-    status.style.color = '#f87171';
+    status.textContent = `✕ Save failed: ${e.message}`;
+    status.style.color = 'var(--err)';
   }
+}
+
+/* ══ CLIP EDITOR ═══════════════════════════════════════════════════
+   Talks to the same endpoints the React dashboard does (edl / rerender /
+   scenes / reframe / subtitle / hook). Every panel edits numbers the server
+   already understands, so nothing here needs a backend change to work. */
+let liveClips = [];
+/* Card data per job, kept so the editor inherits the title, hook and verdict
+   the card already showed — the EDL endpoint deliberately doesn't resend them. */
+const CLIP_CACHE = {};
+const $ = id => document.getElementById(id);
+const ed = {
+  job: null, idx: 0, clip: null, edl: null, words: null, overrides: {},
+  scenes: null, sel: 0, snap: true, play: 0, drag: null,
+  got: {},          // which tabs have fetched (scenes and captions are not free)
+  busy: false,
+};
+
+async function openEditor(job, idx, url) {
+  if (!job) { toast('This clip has no job id — open it from the library', 'err'); return; }
+  ed.job = job; ed.idx = idx; ed.got = {}; ed.overrides = {}; ed.scenes = null;
+  ed.words = null; ed.sel = 0; ed.play = 0;
+  $('editor').classList.remove('hidden');
+  const v = $('edVideo'); v.src = url || '';
+  ed.clip = Object.assign({}, (CLIP_CACHE[job] || [])[idx] || {}, { video_url: url || '' });
+  $('edTitle').textContent = `Clip ${idx + 1}`;
+  $('edMeta').textContent = '';
+  $('edStatus').textContent = 'loading the clip recipe…';
+  switchTab('cut');
+  try {
+    const r = await fetch(`/api/clip/${job}/${idx}/edl`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    ed.edl = await r.json();
+    ed.clip = Object.assign(ed.clip, ed.edl);
+    $('edTitle').textContent = ed.edl.title || `Clip ${idx + 1}`;
+    ed.play = ed.edl.segments[0].start;
+    renderTimeline(); renderVerdicts();
+    $('edMeta').textContent =
+      `${fmt(ed.edl.duration)} · ${ed.edl.segments.length} segment` +
+      (ed.edl.segments.length > 1 ? 's' : '') +
+      (ed.edl.genre ? ` · ${ed.edl.genre}` : '') +
+      (ed.edl.content_style ? ` · ${ed.edl.content_style}` : '');
+    $('edDl').onclick = () => forceDownload(ed.clip.video_url, `short_${idx + 1}.mp4`);
+    $('edStatus').textContent = ed.edl.source.available
+      ? 'source on disk — you can extend the cut'
+      : 'source gone: trims stay inside the original range';
+  } catch (e) {
+    $('edStatus').textContent = '';
+    showErrorInEditor('Could not open the editor: ' + e.message);
+  }
+}
+
+function showErrorInEditor(msg) {
+  $('edVerdict').innerHTML = `<div class="audit bad">${esc(msg)}</div>`;
+}
+
+function closeEditor() {
+  $('editor').classList.add('hidden');
+  $('edVideo').pause();
+  $('frVideo').pause();
+}
+
+function fmt(t) {
+  t = Math.max(0, t || 0);
+  const m = Math.floor(t / 60), s = t - m * 60;
+  return m ? `${m}:${s.toFixed(1).padStart(4, '0')}` : `${s.toFixed(1)}s`;
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.edTab').forEach(b =>
+    b.setAttribute('aria-selected', String(b.dataset.tab === name)));
+  ['cut', 'captions', 'frame', 'hook'].forEach(p =>
+    $('panel-' + p).classList.toggle('hidden', p !== name));
+  if (name === 'captions' && !ed.got.captions) loadCaptions();
+}
+
+/* ── Timeline ── */
+function span() { return Math.max(0.001, (ed.edl && ed.edl.source.duration) || 1); }
+function pct(t) { return (t / span()) * 100; }
+
+function renderTimeline() {
+  const E = ed.edl, sp = span(), track = $('tlTrack');
+  // Ruler: a tick every "nice" second, roughly eight of them across the track.
+  const steps = [.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  const step = steps.find(s => sp / s <= 10) || 900;
+  let ruler = '';
+  for (let t = 0; t <= sp; t += step)
+    ruler += `<div class="tlTick" style="left:${pct(t)}%">${t >= 60 ? (t / 60) + 'm' : t + 's'}</div>`;
+  $('tlRuler').innerHTML = ruler;
+
+  // Word density: where the speech actually is. Sampled so a two-hour source
+  // does not put twelve thousand divs on the page.
+  const words = E.words || [];
+  const every = Math.max(1, Math.ceil(words.length / 900));
+  let marks = '';
+  for (let i = 0; i < words.length; i += every) {
+    const w = words[i], prev = words[i - every];
+    const gap = prev ? (w.s - prev.e) : 0;
+    marks += `<div class="tlWord${gap > .6 ? ' sil' : ''}" style="left:${pct(w.s)}%"></div>`;
+  }
+  $('tlWords').innerHTML = marks;
+
+  track.querySelectorAll('.tlSeg').forEach(n => n.remove());
+  E.segments.forEach((s, i) => {
+    const d = document.createElement('div');
+    d.className = 'tlSeg' + (i === ed.sel ? ' sel' : '');
+    d.style.left = pct(s.start) + '%';
+    d.style.width = Math.max(0.6, pct(s.end - s.start)) + '%';
+    d.dataset.i = i;
+    d.innerHTML = `<span>${fmt(s.end - s.start)}</span>` +
+      `<div class="tlH l" data-h="l"></div><div class="tlH r" data-h="r"></div>`;
+    track.appendChild(d);
+  });
+  $('tlPlay').style.left = pct(ed.play) + '%';
+  const total = E.segments.reduce((a, s) => a + (s.end - s.start), 0);
+  $('tlDur').textContent = `${fmt(total)} in ${E.segments.length} segment${E.segments.length > 1 ? 's' : ''}`;
+  $('tlPos').textContent = `playhead ${fmt(ed.play)}`;
+  $('tlNote').textContent = `source track ${fmt(sp)}` +
+    (E.source.available ? '' : ' (from the original cut — source file gone)');
+  $('tlLimits').textContent =
+    `up to ${E.limits.max_segments} segments, ${E.limits.min_segment_seconds}s each, ` +
+    `${E.limits.max_total_seconds}s total` +
+    (E.source.duration_estimated ? ' · source length estimated (no source file)' : '');
+}
+
+function sourceTimeFromEvent(ev) {
+  const box = $('tlTrack').getBoundingClientRect();
+  const f = Math.min(1, Math.max(0, (ev.clientX - box.left) / box.width));
+  return f * span();
+}
+
+/* Nearest word boundary, used when snapping is on — a cut in the middle of a
+   word sounds and reads broken, and the tolerance stops the snap from
+   dragging a hand-placed point somewhere the user did not put it. */
+function snapTo(t, kind) {
+  if (!ed.snap || !ed.edl.words.length) return t;
+  let best = null, bestD = 1.6;
+  for (const w of ed.edl.words) {
+    const c = kind === 'start' ? w.s : w.e;
+    const d = Math.abs(c - t);
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best == null ? t : best;
+}
+
+function clampSegments() {
+  const E = ed.edl, lim = E.limits, sp = span();
+  E.segments = E.segments
+    .map(s => ({ start: Math.min(Math.max(0, s.start), sp),
+                 end: Math.min(Math.max(0, s.end), sp) }))
+    .filter(s => s.end - s.start >= .05)
+    .sort((a, b) => a.start - b.start)
+    .reduce((acc, s) => {                       // merge overlaps
+      const p = acc[acc.length - 1];
+      if (p && s.start <= p.end) p.end = Math.max(p.end, s.end); else acc.push(s);
+      return acc;
+    }, []);
+  ed.sel = Math.min(ed.sel, E.segments.length - 1);
+}
+
+function bindTimeline() {
+  const track = $('tlTrack');
+  track.addEventListener('pointerdown', ev => {
+    const seg = ev.target.closest('.tlSeg');
+    const t = sourceTimeFromEvent(ev);
+    if (!seg) { setPlayhead(t); return; }
+    ed.sel = +seg.dataset.i;
+    const h = ev.target.dataset.h;
+    ed.drag = h ? { mode: h, i: ed.sel } : { mode: 'body', i: ed.sel, grab: t };
+    seg.classList.add('dragging');
+    track.setPointerCapture(ev.pointerId);
+    renderTimeline();
+  });
+  track.addEventListener('pointermove', ev => {
+    if (!ed.drag) return;
+    const t = sourceTimeFromEvent(ev), s = ed.edl.segments[ed.drag.i];
+    const min = ed.edl.limits.min_segment_seconds;
+    if (ed.drag.mode === 'l') s.start = Math.min(snapTo(t, 'start'), s.end - min);
+    else if (ed.drag.mode === 'r') s.end = Math.max(snapTo(t, 'end'), s.start + min);
+    else {
+      const d = t - ed.drag.grab, len = s.end - s.start;
+      let a = s.start + d;
+      a = Math.max(0, Math.min(a, span() - len));
+      s.start = a; s.end = a + len;
+      ed.drag.grab = t;
+    }
+    s.start = Math.max(0, s.start); s.end = Math.min(span(), s.end);
+    renderTimeline();
+  });
+  const up = () => { if (ed.drag) { clampSegments(); ed.drag = null; renderTimeline(); } };
+  track.addEventListener('pointerup', up);
+  track.addEventListener('pointercancel', up);
+}
+
+function setPlayhead(t) {
+  ed.play = Math.min(Math.max(0, t), span());
+  $('tlPlay').style.left = pct(ed.play) + '%';
+  $('tlPos').textContent = `playhead ${fmt(ed.play)}`;
+  const s = ed.edl.segments.find(x => ed.play >= x.start && ed.play <= x.end);
+  if (s) $('edVideo').currentTime = Math.max(0, ed.play - s.start);
+}
+
+function bindTimelineTools() {
+  $('tlSnap').onclick = () => {
+    ed.snap = !ed.snap;
+    $('tlSnap').setAttribute('aria-pressed', String(ed.snap));
+  };
+  $('tlSplit').onclick = () => {
+    const s = ed.edl.segments[ed.sel];
+    const min = ed.edl.limits.min_segment_seconds;
+    if (!(ed.play > s.start + min && ed.play < s.end - min)) {
+      toast('Put the playhead inside a segment, at least ' + min + 's from both edges', 'err');
+      return;
+    }
+    const right = { start: ed.play, end: s.end };
+    s.end = ed.play;
+    ed.edl.segments.splice(ed.sel + 1, 0, right);
+    ed.sel++;
+    renderTimeline();
+  };
+  $('tlDrop').onclick = () => {
+    if (ed.edl.segments.length < 2) { toast('A clip needs at least one segment', 'err'); return; }
+    ed.edl.segments.splice(ed.sel, 1);
+    ed.sel = Math.max(0, ed.sel - 1);
+    renderTimeline();
+  };
+  $('tlMerge').onclick = () => {
+    const E = ed.edl;
+    if (ed.sel === 0) { toast('Select a segment after another one to un-skip the gap', 'err'); return; }
+    const prev = E.segments[ed.sel - 1];
+    prev.end = Math.max(prev.end, E.segments[ed.sel].end);
+    E.segments.splice(ed.sel, 1);
+    ed.sel--;
+    renderTimeline();
+  };
+  $('tlFit').onclick = () => {
+    ed.edl.segments = [{ ...ed.edl.canonical_range }];
+    ed.sel = 0;
+    renderTimeline();
+  };
+  $('edSaveCut').onclick = saveCut;
+}
+
+async function saveCut() {
+  const E = ed.edl, lim = E.limits;
+  const total = E.segments.reduce((a, s) => a + (s.end - s.start), 0);
+  const bad = E.segments.find(s => s.end - s.start < lim.min_segment_seconds - .01);
+  if (bad) { toast(`A segment is shorter than ${lim.min_segment_seconds}s`, 'err'); return; }
+  if (E.segments.length > lim.max_segments) { toast(`At most ${lim.max_segments} segments`, 'err'); return; }
+  if (total > lim.max_total_seconds) { toast(`Total length over ${lim.max_total_seconds}s`, 'err'); return; }
+  if (!E.source.available && !recutWithinCanonical(E.segments, E.canonical_range)) {
+    toast('The source video is gone, so the cut cannot reach outside the original range', 'err');
+    return;
+  }
+  await runEditorTask($('edCutStatus'), 're-rendering…', async () => {
+    const reapplied = $('edReapply').value === '1';
+    const r = await fetch('/api/clip/rerender', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id: ed.job, clip_index: ed.idx,
+        segments: E.segments.map(s => ({ start: round3(s.start), end: round3(s.end) })),
+        snap_to_words: ed.snap,
+        reapply_captions: reapplied,
+        framing: $('edFraming').value,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    E.segments = j.recipe.segments; E.duration = j.duration;
+    E.canonical_range = j.recipe.canonical_range || E.canonical_range;
+    ed.clip.video_url = j.new_video_url;
+    // The server re-audited the captions it just burned for this cut; without
+    // taking the new verdict the pill would keep certifying the old range.
+    if ('caption_review' in j) {
+      ed.clip.caption_review = j.caption_review;
+      renderVerdicts();
+    }
+    $('edVideo').src = j.new_video_url;
+    renderTimeline();
+    const rv = j.caption_review;
+    return `saved — ${j.render_path === 'fast' ? 're-cut from the clip (no re-framing)' : 're-cut from the source'}` +
+      (!reqReapply() ? ' (no captions)'
+        : rv && (rv.issues || []).length ? ` — ${rv.issues.length} caption problem(s)`
+        : rv ? ' — captions read clean' : '');
+  });
+}
+
+function recutWithinCanonical(segs, range) {
+  return segs.every(s => s.start >= range.start - .05 && s.end <= range.end + .05);
+}
+function round3(n) { return Math.round(n * 1000) / 1000; }
+
+/* Shared task runner: one edit at a time, inline status, toast on failure. */
+async function runEditorTask(node, working, fn) {
+  if (ed.busy) { toast('Another render is still running', 'err'); return; }
+  ed.busy = true;
+  node.textContent = working; node.style.color = 'var(--info)';
+  try {
+    const msg = await fn();
+    node.textContent = msg || 'done'; node.style.color = 'var(--ok)';
+    toast(msg || 'Done', 'ok');
+    refreshCards();
+  } catch (e) {
+    node.textContent = '✕ ' + e.message; node.style.color = 'var(--err)';
+    toast('Failed: ' + e.message, 'err');
+  } finally { ed.busy = false; }
+}
+
+function refreshCards() {
+  if (ed.job === jobId && liveClips.length) {
+    const c = liveClips[ed.idx];
+    if (c) Object.assign(c, { video_url: ed.clip.video_url,
+                              caption_review: ed.clip.caption_review });
+    showClips({ clips: liveClips });
+  } else if (document.getElementById('view-library').classList.contains('active')) {
+    loadLibrary();
+  }
+}
+
+/* ── Verdicts ── */
+function renderVerdicts() {
+  const rv = ed.clip.caption_review;
+  $('edVerdict').innerHTML = rv ? verdictHtml(rv) : '';
+  $('capVerdict').innerHTML = rv ? verdictHtml(rv, true) : '';
+}
+
+function verdictHtml(rv, withStats) {
+  const n = (rv.issues || []).length;
+  if (!n) return `<div class="audit good"><div><b>Captions read as speech</b>
+    The text on this clip parses at a normal reading pace.</div></div>`;
+  const list = rv.issues.map((code, i) => {
+    // The server measured the real numbers behind each problem; quote them when
+    // they arrived, since "reads at 31 chars/s" tells you more than the label.
+    const why = (rv.detail || [])[i];
+    return `<li>${esc(AUDIT_COPY[code] || code)}${why ? ` — <span style="font-family:var(--mono);font-size:11px">${esc(why)}</span>` : ''}</li>`;
+  }).join('');
+  const st = withStats && rv.stats
+    ? `<div style="margin-top:6px;font-family:var(--mono);font-size:11px;opacity:.75">
+         ${rv.stats.chars_per_sec} chars/s · ${rv.stats.words_per_sec} words/s ·
+         ${rv.stats.blocks} blocks</div>` : '';
+  return `<div class="audit bad"><div><b>${n} caption problem${n > 1 ? 's' : ''}</b>
+    <ul style="margin-left:16px">${list}</ul>${st}
+    <div style="margin-top:6px;opacity:.85">Fix it on the timeline (move the cut onto a sentence
+    boundary) or rewrite the words below.</div></div></div>`;
+}
+
+/* ── Captions ── */
+async function loadCaptions() {
+  if (!ed.edl) return;
+  try {
+    const r = await fetch(`/api/clip/${ed.job}/${ed.idx}/transcript`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const j = await r.json();
+    ed.words = (j.captions || []).map(w => ({ ...w, text: (w.text || '').trim() }));
+    ed.got.captions = true;
+    if (!$('capPreset').options.length) fillPresets();
+    renderCaptionBlocks();
+  } catch (e) {
+    $('capBlocks').innerHTML = `<div class="audit bad">No caption track: ${esc(e.message)}</div>`;
+  }
+}
+
+function fillPresets() {
+  const sel = $('capPreset');
+  sel.innerHTML = CAPTION_TEMPLATES.map(t =>
+    `<option value="${t.name}">${t.name}</option>`).join('');
+  sel.value = activeTemplate;
+  sel.onchange = () => applyPreset(sel.value);
+  applyPreset(activeTemplate);
+}
+
+function applyPreset(name) {
+  const t = CAPTION_TEMPLATES.find(x => x.name === name) || {};
+  $('capSize').value = t.font_size || 44;
+  $('capColor').value = normHex(t.font_color, '#ffffff');
+  $('capHi').value = normHex(t.highlight_color, '#ffd700');
+  $('capBorder').value = normHex(t.border_color, '#000000');
+  $('capBorderW').value = t.border_width ?? 4;
+  $('capEffect').value = t.effect || 'pop';
+  $('capDim').value = Math.round((t.base_opacity ?? 1) * 100);
+  $('capUpper').value = t.uppercase ? '1' : '0';
+  $('capChars').value = t.max_chars || 16;
+  $('capStyle').value = 'karaoke';
+  syncSwatchLabels();
+  renderCaptionBlocks();
+}
+
+function normHex(c, fallback) {
+  const s = (c || fallback).replace('#', '');
+  return '#' + (s.length === 3 ? s.split('').map(x => x + x).join('') : s.slice(0, 6));
+}
+function syncSwatchLabels() {
+  $('capColorHex').textContent = $('capColor').value;
+  $('capHiHex').textContent = $('capHi').value;
+  $('capBorderHex').textContent = $('capBorder').value;
+  $('capDimVal').textContent = $('capDim').value + '%';
+}
+
+/* Group words into the lines the renderer would build, so what you edit and
+   what burns break the same way. */
+function captionBlocks() {
+  const maxChars = Math.max(6, +$('capChars').value || 16);
+  const out = []; let cur = [];
+  for (const w of ed.words) {
+    const len = cur.reduce((a, x) => a + x.text.length + 1, 0);
+    const gap = cur.length ? (w.startMs - cur[cur.length - 1].endMs) / 1000 : 0;
+    if (cur.length && (len + w.text.length > maxChars || gap > .8)) { out.push(cur); cur = []; }
+    cur.push(w);
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+function renderCaptionBlocks() {
+  const host = $('capBlocks');
+  if (!ed.words || !ed.words.length) { host.innerHTML = '<p class="empty">No words in this clip.</p>'; return; }
+  host.innerHTML = captionBlocks().map(blk => {
+    const t0 = blk[0].startMs / 1000, t1 = blk[blk.length - 1].endMs / 1000;
+    return `<div class="capBlock"><div class="t">${fmt(t0)}–${fmt(t1)}</div>
+      <div class="capWords">${blk.map(w => {
+        const i = ed.words.indexOf(w);
+        return `<input class="capWord" value="${esc(w.text)}" data-i="${i}" spellcheck="false" />` +
+               `<button class="capDel" data-del="${i}" aria-label="Delete word">×</button>`;
+      }).join('')}<button class="capAdd" data-add="${ed.words.indexOf(blk[blk.length - 1])}">+ word</button></div>
+    </div>`;
+  }).join('');
+  host.querySelectorAll('.capWord').forEach(inp => inp.oninput = () => {
+    ed.words[+inp.dataset.i].text = inp.value;
+  });
+  host.querySelectorAll('.capDel').forEach(b => b.onclick = () => {
+    ed.words.splice(+b.dataset.del, 1); renderCaptionBlocks();
+  });
+  host.querySelectorAll('.capAdd').forEach(b => b.onclick = () => {
+    const i = +b.dataset.add, w = ed.words[i];
+    ed.words.splice(i + 1, 0, { text: 'new', startMs: w.endMs + 40, endMs: w.endMs + 340 });
+    renderCaptionBlocks();
+  });
+}
+
+async function applyCaptions() {
+  const words = (ed.words || []).filter(w => w.text.trim())
+    .map(w => ({ text: w.text.trim(), startMs: w.startMs, endMs: w.endMs }));
+  if (!words.length) { toast('There is no caption text left to burn', 'err'); return; }
+  await runEditorTask($('capStatus'), 'burning captions…', async () => {
+    const r = await fetch('/api/subtitle', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id: ed.job, clip_index: ed.idx,
+        style: $('capStyle').value, position: $('capPos').value,
+        font_size: +$('capSize').value, font_name: 'Anton',
+        font_color: $('capColor').value, highlight_color: $('capHi').value,
+        border_color: $('capBorder').value, border_width: +$('capBorderW').value,
+        effect: $('capEffect').value, base_opacity: +$('capDim').value / 100,
+        uppercase: $('capUpper').value === '1',
+        max_chars: +$('capChars').value,
+        words,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    ed.clip.video_url = j.new_video_url;
+    $('edVideo').src = j.new_video_url;
+    if (j.caption_review) { ed.clip.caption_review = j.caption_review; renderVerdicts(); }
+    const rv = j.caption_review;
+    return rv && (rv.issues || []).length
+      ? `burned — still ${rv.issues.length} caption problem(s)` : 'burned — captions read clean';
+  });
+}
+
+async function removeCaptions() {
+  await runEditorTask($('capStatus'), 'switching to the clean file…', async () => {
+    const r = await fetch('/api/subtitle/remove', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: ed.job, clip_index: ed.idx }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    ed.clip.video_url = j.new_video_url || j.video_url || ed.clip.video_url;
+    $('edVideo').src = ed.clip.video_url;
+    return 'captions removed';
+  });
+}
+
+function bindCaptionControls() {
+  ['capColor', 'capHi', 'capBorder'].forEach(id => $(id).oninput = syncSwatchLabels);
+  $('capDim').oninput = syncSwatchLabels;
+  $('capChars').onchange = renderCaptionBlocks;
+  $('capApply').onclick = applyCaptions;
+  $('capRemove').onclick = removeCaptions;
+}
+
+/* ── Framing ── */
+async function loadScenes() {
+  await runEditorTask($('frStatus'), 'detecting scenes (cuts a working file, ~10s)…', async () => {
+    const r = await fetch(`/api/clip/${ed.job}/${ed.idx}/scenes`);
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    ed.scenes = j; ed.got.frame = true;
+    Object.keys(j.saved_overrides || {}).forEach(k => { ed.overrides[k] = j.saved_overrides[k]; });
+    $('frPreview').classList.remove('hidden');
+    $('frVideo').src = j.preview_url;
+    renderScenes();
+    return `${j.scenes.length} scene${j.scenes.length > 1 ? 's' : ''} · source ${j.source_width}×${j.source_height}`;
+  });
+}
+
+function renderScenes() {
+  const cw = ed.scenes.crop_width_fraction;
+  $('frStrip').innerHTML = ed.scenes.scenes.map(s => {
+    const ov = ed.overrides[String(s.index)];
+    const stacked = ov && typeof ov === 'object';
+    const cx = stacked ? ov.top.x : (typeof ov === 'number' ? ov : s.suggested_center);
+    const half = (cw / 2) * 100;
+    const left = Math.min(Math.max(cx * 100 - half, 0), 100 - half * 2);
+    return `<div class="scn" data-s="${s.index}">
+      <div class="scnImg">${s.thumbnail_url
+        ? `<img src="${s.thumbnail_url}" alt="scene ${s.index} frame">` : ''}
+        <div class="scnCrop" style="left:${left}%;width:${half * 2}%"></div></div>
+      <div class="scnTime">${fmt(s.start)} – ${fmt(s.end)}</div>
+      <label>Centre X</label>
+      <input type="range" min="0" max="100" value="${Math.round(cx * 100)}" data-x="${s.index}" />
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" data-stack="${s.index}" ${stacked ? 'checked' : ''}
+               style="width:auto;accent-color:var(--accent)" />
+        Two people — stack top and bottom</label>
+      ${stacked ? `<label>Top X / Bottom X / Height</label>
+        <div style="display:flex;gap:6px">
+          <input type="range" min="0" max="100" value="${Math.round(ov.top.x * 100)}" data-tx="${s.index}" />
+          <input type="range" min="0" max="100" value="${Math.round(ov.bottom.x * 100)}" data-bx="${s.index}" />
+          <input type="range" min="10" max="90" value="${Math.round(ov.top.y * 100)}" data-y="${s.index}" />
+        </div>` : ''}
+    </div>`;
+  }).join('');
+  $('frStrip').querySelectorAll('[data-x]').forEach(el => el.oninput = () => {
+    const i = el.dataset.x;
+    const cur = ed.overrides[i];
+    if (cur && typeof cur === 'object') return;
+    ed.overrides[i] = +el.value / 100;
+    const half = (ed.scenes.crop_width_fraction / 2) * 100;
+    el.closest('.scn').querySelector('.scnCrop').style.left =
+      Math.min(Math.max(+el.value - half, 0), 100 - half * 2) + '%';
+  });
+  $('frStrip').querySelectorAll('[data-stack]').forEach(el => el.onchange = () => {
+    const i = el.dataset.stack, s = ed.scenes.scenes.find(x => String(x.index) === i);
+    if (el.checked) {
+      const x = typeof ed.overrides[i] === 'number' ? ed.overrides[i] : s.suggested_center;
+      ed.overrides[i] = { top: { x, y: .35 }, bottom: { x, y: .65 } };
+    } else {
+      ed.overrides[i] = typeof ed.overrides[i] === 'object'
+        ? ed.overrides[i].top.x
+        : (typeof ed.overrides[i] === 'number' ? ed.overrides[i] : s.suggested_center);
+    }
+    renderScenes();
+  });
+  ['tx', 'bx', 'y'].forEach(k => $('frStrip').querySelectorAll(`[data-${k}]`)
+    .forEach(el => el.oninput = () => {
+      const o = ed.overrides[el.dataset[k]];
+      if (!o) return;
+      const v = +el.value / 100;
+      if (k === 'tx') o.top.x = v; else if (k === 'bx') o.bottom.x = v;
+      else { o.top.y = v; o.bottom.y = 1 - v; }
+    }));
+}
+
+async function saveFraming() {
+  const keys = Object.keys(ed.overrides);
+  if (!keys.length) { toast('Move a framing slider first', 'err'); return; }
+  await runEditorTask($('frStatus'), 're-framing from the source…', async () => {
+    const r = await fetch('/api/clip/reframe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id: ed.job, clip_index: ed.idx, crop_overrides: ed.overrides,
+        reapply_captions: $('edReapply').value === '1',
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    ed.clip.video_url = j.new_video_url;
+    $('edVideo').src = j.new_video_url;
+    return `framed ${j.framed_scenes.length} scene(s)`;
+  });
+}
+
+/* ── Hook ── */
+function syncHookForm() {
+  $('hookText').value = ed.clip.viral_hook_text || ed.clip.title || '';
+  const burned = ed.clip.auto_hook || null;
+  if (burned) {
+    $('hookText').value = burned.text || '';
+    $('hookPos').value = burned.position || 'top';
+    $('hookStyle').value = burned.style || 'classic';
+    $('hookDur').value = burned.duration_seconds ?? '';
+  }
+}
+
+async function applyHook(remove) {
+  const text = $('hookText').value.trim();
+  if (!remove && !text) { toast('Write a hook first, or use Remove', 'err'); return; }
+  await runEditorTask($('hookStatus'), remove ? 'stripping the hook…' : 'burning the hook…', async () => {
+    const r = await fetch('/api/hook', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id: ed.job, clip_index: ed.idx, remove: !!remove,
+        text: remove ? '' : text, position: $('hookPos').value,
+        size: $('hookSize').value, style: $('hookStyle').value,
+        duration_seconds: remove || $('hookDur').value === ''
+          ? null : parseFloat($('hookDur').value),
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    ed.clip.video_url = j.new_video_url;
+    $('edVideo').src = j.new_video_url;
+    return remove ? 'hook removed' : 'hook burned in';
+  });
+}
+
+/* ── Wiring ── */
+document.querySelectorAll('.edTab').forEach(b => b.onclick = () => {
+  switchTab(b.dataset.tab);
+  if (b.dataset.tab === 'hook') syncHookForm();
+  if (b.dataset.tab === 'frame' && !ed.got.frame) loadScenes();
+});
+$('edCloseBtn').onclick = closeEditor;
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('editor').classList.contains('hidden')) closeEditor();
+});
+$('editor').addEventListener('click', e => { if (e.target === $('editor')) closeEditor(); });
+bindTimeline(); bindTimelineTools(); bindCaptionControls();
+$('frLoad').onclick = loadScenes;
+$('frSave').onclick = saveFraming;
+$('hookApply').onclick = () => applyHook(false);
+$('hookRemove').onclick = () => applyHook(true);
+$('edVideo').addEventListener('timeupdate', () => {
+  if (ed.drag || !ed.edl) return;
+  const t = $('edVideo').currentTime;
+  // Map clip time back onto the source track through the segment layout.
+  let acc = 0, src = null;
+  for (const s of ed.edl.segments) {
+    const len = s.end - s.start;
+    if (t <= acc + len + .05) { src = s.start + Math.min(Math.max(t - acc, 0), len); break; }
+    acc += len;
+  }
+  if (src != null) { ed.play = src; $('tlPlay').style.left = pct(src) + '%'; }
+});
+
+/* ── Boot ── */
+clampClips();
+pingEngine(); setInterval(pingEngine, 15000);
+loadEngineInfo(); setInterval(loadEngineInfo, 15000);  // pool cooldown countdown
+loadTemplates();
+const bootView = (location.hash || '').replace('#/', '');
+showView(VIEW_META[bootView] ? bootView : 'create');
+if (!document.getElementById('libCount').textContent) loadLibrarySoft();
+async function loadLibrarySoft() {
+  try {
+    const data = await (await fetch('/api/jobs')).json();
+    document.getElementById('libCount').textContent = (data.jobs || []).length || '';
+  } catch (e) { /* count is decoration */ }
 }
 </script>
 </body>
